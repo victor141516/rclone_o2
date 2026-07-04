@@ -31,7 +31,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, option
 	}
 
 	apiLeaf := f.opt.Enc.FromStandardName(leaf)
-	metadata, err := uploadMetadata(apiLeaf, folderID, src.Size(), mimeType)
+	metadata, err := uploadMetadata(apiLeaf, folderID, src.Size())
 	if err != nil {
 		return nil, err
 	}
@@ -54,17 +54,13 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, option
 	return f.newObjectFromUpload(ctx, src, uploadResp, folderID, mimeType), nil
 }
 
-func uploadMetadata(name string, folderID, size int64, mimeType string) ([]byte, error) {
-	data := map[string]any{
+func uploadMetadata(name string, folderID, size int64) ([]byte, error) {
+	return json.Marshal(map[string]any{"data": map[string]any{
 		"name":             name,
 		"size":             size,
 		"folderid":         folderID,
 		"modificationdate": "",
-	}
-	if mimeType != "" && !strings.HasPrefix(mimeType, "audio/") {
-		data["contenttype"] = mimeType
-	}
-	return json.Marshal(map[string]any{"data": data})
+	}})
 }
 
 func (f *Fs) newUploadRequest(ctx context.Context, metadata []byte, fileName string, size int64, mimeType string, in io.Reader) (*http.Request, error) {
@@ -159,22 +155,15 @@ func writeUploadParts(mw *multipart.Writer, metadata []byte, fileName, mimeType 
 func createUploadFilePart(mw *multipart.Writer, fileName, mimeType string) (io.Writer, error) {
 	header := make(textproto.MIMEHeader)
 	header.Set("Content-Disposition", `form-data; name="file"; filename="`+escapeMultipartQuotes(fileName)+`"`)
-	header.Set("Content-Type", uploadFileContentType(fileName, mimeType))
+	header.Set("Content-Type", uploadFileContentType(mimeType))
 	return mw.CreatePart(header)
 }
 
-func uploadFileContentType(fileName, mimeType string) string {
-	if hasExtension(fileName, ".m4a") {
-		return "audio/x-m4a"
-	}
+func uploadFileContentType(mimeType string) string {
 	if mimeType == "" {
 		return "application/octet-stream"
 	}
 	return mimeType
-}
-
-func hasExtension(name, ext string) bool {
-	return len(name) >= len(ext) && strings.EqualFold(name[len(name)-len(ext):], ext)
 }
 
 func escapeMultipartQuotes(s string) string {
