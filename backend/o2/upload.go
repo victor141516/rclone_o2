@@ -87,11 +87,8 @@ func (f *Fs) newUploadRequest(ctx context.Context, metadata []byte, fileName str
 		closeUploadBody(body)
 		return nil, err
 	}
-	f.addHeaders(req)
-	req.Header.Del("Cookie")
-	if f.opt.JSessionID != "" {
-		req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
-	}
+	f.addCommonHeaders(req)
+	f.addUploadCookie(req)
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "*/*")
 	if contentLength >= 0 {
