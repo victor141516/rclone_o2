@@ -635,7 +635,7 @@ func TestUploadSendsKnownLengthMultipartBodyAndReturnsAcceptedObject(t *testing.
 	}
 }
 
-func TestUploadRequestUsesAsyncForLargeFiles(t *testing.T) {
+func TestUploadRequestAlwaysUsesAsync(t *testing.T) {
 	ctx := context.Background()
 	f := &Fs{
 		opt: Options{
@@ -646,7 +646,7 @@ func TestUploadRequestUsesAsyncForLargeFiles(t *testing.T) {
 		},
 	}
 
-	req, err := f.newUploadRequest(ctx, []byte(`{"data":{}}`), "large.bin", minAsyncUploadFileSizeBytes+1, "application/octet-stream", strings.NewReader(""))
+	req, err := f.newUploadRequest(ctx, []byte(`{"data":{}}`), "small.bin", 1, "application/octet-stream", strings.NewReader(""))
 	if err != nil {
 		t.Fatal(err)
 	}
