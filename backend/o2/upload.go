@@ -61,7 +61,7 @@ func uploadMetadata(name string, folderID, size int64, mimeType string) ([]byte,
 		"folderid":         folderID,
 		"modificationdate": "",
 	}
-	if mimeType != "" && !strings.Contains(mimeType, "audio") {
+	if mimeType != "" && !strings.HasPrefix(mimeType, "audio/") {
 		data["contenttype"] = mimeType
 	}
 	return json.Marshal(map[string]any{"data": data})
