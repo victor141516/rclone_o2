@@ -15,8 +15,6 @@ import (
 	"github.com/rclone/rclone/fs"
 )
 
-const minAsyncUploadFileSizeBytes = 200 * 1024 * 1024
-
 var multipartQuoteReplacer = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
 
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
@@ -64,12 +62,7 @@ func uploadMetadata(name string, folderID, size int64) ([]byte, error) {
 }
 
 func (f *Fs) newUploadRequest(ctx context.Context, metadata []byte, fileName string, size int64, mimeType string, in io.Reader) (*http.Request, error) {
-	rawURL := f.opt.UploadURL + "/sapi/upload?action=save"
-	if size > minAsyncUploadFileSizeBytes {
-		rawURL += "&acceptasynchronous=true"
-	}
-
-	u, err := f.addValidationKey(rawURL)
+	u, err := f.addValidationKey(f.opt.UploadURL + "/sapi/upload?action=save&acceptasynchronous=true")
 	if err != nil {
 		return nil, err
 	}
