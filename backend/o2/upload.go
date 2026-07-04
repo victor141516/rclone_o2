@@ -164,13 +164,17 @@ func createUploadFilePart(mw *multipart.Writer, fileName, mimeType string) (io.W
 }
 
 func uploadFileContentType(fileName, mimeType string) string {
-	if strings.HasSuffix(strings.ToLower(fileName), ".m4a") {
+	if hasExtension(fileName, ".m4a") {
 		return "audio/x-m4a"
 	}
 	if mimeType == "" {
 		return "application/octet-stream"
 	}
 	return mimeType
+}
+
+func hasExtension(name, ext string) bool {
+	return len(name) >= len(ext) && strings.EqualFold(name[len(name)-len(ext):], ext)
 }
 
 func escapeMultipartQuotes(s string) string {

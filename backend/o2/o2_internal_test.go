@@ -662,7 +662,7 @@ func TestUploadRequestUsesAsyncForLargeFiles(t *testing.T) {
 }
 
 func TestUploadBodyUsesBrowserM4AFileContentType(t *testing.T) {
-	body, contentType, _, err := newUploadBody([]byte(`{"data":{}}`), "song.m4a", int64(len("payload")), "audio/mpeg", strings.NewReader("payload"))
+	body, contentType, _, err := newUploadBody([]byte(`{"data":{}}`), "song.M4A", int64(len("payload")), "audio/mpeg", strings.NewReader("payload"))
 	if err != nil {
 		t.Fatal(err)
 	}
