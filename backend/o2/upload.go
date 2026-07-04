@@ -199,13 +199,8 @@ func (f *Fs) doUpload(ctx context.Context, req *http.Request, remote string, fol
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return uploadResp, parseAPIError(resp)
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&uploadResp); err != nil {
-		return uploadResp, err
-	}
-	if uploadResp.Error != nil {
-		return uploadResp, &apiError{StatusCode: resp.StatusCode, Code: uploadResp.Error.Code, Message: uploadResp.Error.Message}
-	}
-	return uploadResp, nil
+	err = decodeAPIResponse(resp, &uploadResp)
+	return uploadResp, err
 }
 
 func (f *Fs) newObjectFromUpload(ctx context.Context, src fs.ObjectInfo, uploadResp api.UploadResponse, folderID int64, mimeType string) *Object {
