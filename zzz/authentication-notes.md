@@ -195,6 +195,19 @@ descarta una regresion del cliente en esa prueba y sugiere que la velocidad
 puede depender de estado temporal de sesion/backend, no solo de la forma exacta
 de la request.
 
+Pruebas genericas del 2026-07-05:
+
+- Se elimino la logica especifica para `.m4a`. El upload usa el MIME detectado
+  por rclone para la parte `file`, o `application/octet-stream` si no se conoce.
+- La metadata de upload es la misma para cualquier extension: no se envia
+  `contenttype` en el JSON `data`.
+- Subidas con datos aleatorios de 32 MiB y extensiones `.m4a`, `.txt`, `.exe` y
+  `.zxq` completaron correctamente.
+- Una subida desde el propio Chrome con `fetch` + `FormData`, Blob aleatorio de
+  16 MiB y extension inventada `.zxq`, tambien fue lenta (~2.17 MiB/s). Por
+  tanto, en esa medicion la lentitud no era especifica de rclone ni de la
+  extension.
+
 ## Errores vistos al reducir headers
 
 Estos resultados todavia no son concluyentes porque habia autenticaciones SMS
