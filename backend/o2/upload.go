@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -17,6 +16,8 @@ import (
 )
 
 const minAsyncUploadFileSizeBytes = 200 * 1024 * 1024
+
+var multipartQuoteReplacer = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
 
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	leaf, folderID, err := f.parentFolderID(ctx, src.Remote(), true)
@@ -157,7 +158,7 @@ func writeUploadParts(mw *multipart.Writer, metadata []byte, fileName, mimeType 
 
 func createUploadFilePart(mw *multipart.Writer, fileName, mimeType string) (io.Writer, error) {
 	header := make(textproto.MIMEHeader)
-	header.Set("Content-Disposition", fmt.Sprintf(`form-data; name="file"; filename="%s"`, escapeMultipartQuotes(fileName)))
+	header.Set("Content-Disposition", `form-data; name="file"; filename="`+escapeMultipartQuotes(fileName)+`"`)
 	header.Set("Content-Type", uploadFileContentType(fileName, mimeType))
 	return mw.CreatePart(header)
 }
@@ -173,7 +174,7 @@ func uploadFileContentType(fileName, mimeType string) string {
 }
 
 func escapeMultipartQuotes(s string) string {
-	return strings.NewReplacer("\\", "\\\\", `"`, "\\\"").Replace(s)
+	return multipartQuoteReplacer.Replace(s)
 }
 
 func (f *Fs) doUpload(ctx context.Context, req *http.Request, remote string, folderID, size int64) (api.UploadResponse, error) {
