@@ -189,6 +189,12 @@ multipart, sino en la sesion concreta guardada en la config. Actualizar
 `validation_key`, `jsessionid`, `plc` y `device_id` con los valores de la sesion
 rapida de Chrome hace que el mismo comando de rclone suba a velocidad de web.
 
+Matiz observado el 2026-07-05: la misma sesion de Chrome y el mismo nodo del ELB
+tambien dieron el camino lento (~5 MiB/s) tanto con rclone como con `curl`. Eso
+descarta una regresion del cliente en esa prueba y sugiere que la velocidad
+puede depender de estado temporal de sesion/backend, no solo de la forma exacta
+de la request.
+
 ## Errores vistos al reducir headers
 
 Estos resultados todavia no son concluyentes porque habia autenticaciones SMS
