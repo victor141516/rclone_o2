@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -27,6 +28,7 @@ type apiError struct {
 	StatusCode int
 	Code       string
 	Message    string
+	Data       string
 }
 
 func (e *apiError) Error() string {
@@ -47,8 +49,15 @@ func (f *Fs) addHeaders(req *http.Request) {
 	req.Header.Set("X-deviceid", f.opt.DeviceID)
 	req.Header.Set("Referer", f.opt.APIURL+"/")
 	req.Header.Set("Origin", f.opt.APIURL)
-	req.AddCookie(&http.Cookie{Name: "validationKey", Value: f.opt.ValidationKey})
-	req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
+	if f.opt.ValidationKey != "" {
+		req.AddCookie(&http.Cookie{Name: "validationKey", Value: f.opt.ValidationKey})
+	}
+	if f.opt.JSessionID != "" {
+		req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
+	}
+	if f.opt.PLC != "" {
+		req.AddCookie(&http.Cookie{Name: "PLC", Value: f.opt.PLC})
+	}
 }
 
 func (f *Fs) addValidationKey(rawURL string) (string, error) {
@@ -104,19 +113,45 @@ func noRequestBody() (io.Reader, string, error) {
 }
 
 func (f *Fs) doRequest(ctx context.Context, method, rawURL string, body requestBody, out any) (err error) {
-	u, err := f.addValidationKey(rawURL)
-	if err != nil {
-		return err
+	for try := 0; try < 2; try++ {
+		u, err := f.addValidationKey(rawURL)
+		if err != nil {
+			return err
+		}
+
+		resp, err := f.doHTTPRequest(ctx, method, u, body)
+		if err != nil {
+			return err
+		}
+
+		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+			setCookies := resp.Cookies()
+			err := parseAPIError(resp)
+			closeResponse(resp)
+			if try == 0 && f.shouldRenewSession(err) {
+				if err := f.applySessionRenewal(err, setCookies); err != nil {
+					return err
+				}
+				continue
+			}
+			return err
+		}
+
+		defer fs.CheckClose(resp.Body, &err)
+		return decodeAPIResponse(resp, out)
 	}
 
-	var resp *http.Response
+	return errors.New("O2 session renewal failed")
+}
+
+func (f *Fs) doHTTPRequest(ctx context.Context, method, rawURL string, body requestBody) (resp *http.Response, err error) {
 	err = f.pacer.Call(func() (bool, error) {
-		req, err := f.newAPIRequest(ctx, method, u, body)
+		req, err := f.newAPIRequest(ctx, method, rawURL, body)
 		if err != nil {
 			return false, err
 		}
 
-		fs.Debugf(f, "O2 API %s %s", method, redactedURL(u))
+		fs.Debugf(f, "O2 API %s %s", method, redactedURL(rawURL))
 		resp, err = f.client.Do(req)
 		retry, err := shouldRetry(ctx, resp, err)
 		if retry {
@@ -127,14 +162,9 @@ func (f *Fs) doRequest(ctx context.Context, method, rawURL string, body requestB
 	})
 	if err != nil {
 		closeResponse(resp)
-		return err
+		return nil, err
 	}
-	defer fs.CheckClose(resp.Body, &err)
-
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return parseAPIError(resp)
-	}
-	return decodeAPIResponse(resp, out)
+	return resp, nil
 }
 
 func (f *Fs) newAPIRequest(ctx context.Context, method, rawURL string, body requestBody) (*http.Request, error) {
@@ -180,15 +210,50 @@ func envelopeError(statusCode int, e *api.Error) error {
 	if e == nil {
 		return nil
 	}
-	return &apiError{StatusCode: statusCode, Code: e.Code, Message: e.Message}
+	return &apiError{StatusCode: statusCode, Code: e.Code, Message: e.Message, Data: e.Data}
 }
 
 func parseAPIError(resp *http.Response) error {
 	var env api.Envelope
 	if err := json.NewDecoder(resp.Body).Decode(&env); err == nil && env.Error != nil {
-		return &apiError{StatusCode: resp.StatusCode, Code: env.Error.Code, Message: env.Error.Message}
+		return &apiError{StatusCode: resp.StatusCode, Code: env.Error.Code, Message: env.Error.Message, Data: env.Error.Data}
 	}
 	return &apiError{StatusCode: resp.StatusCode}
+}
+
+func (f *Fs) shouldRenewSession(err error) bool {
+	var apiErr *apiError
+	return errors.As(err, &apiErr) && apiErr.Code == "SEC-1003" && apiErr.Data != "" && f.opt.PLC != ""
+}
+
+func (f *Fs) applySessionRenewal(err error, cookies []*http.Cookie) error {
+	var apiErr *apiError
+	if !errors.As(err, &apiErr) {
+		return err
+	}
+
+	f.authMu.Lock()
+	defer f.authMu.Unlock()
+
+	f.opt.ValidationKey = apiErr.Data
+	for _, cookie := range cookies {
+		switch cookie.Name {
+		case "JSESSIONID":
+			f.opt.JSessionID = cookie.Value
+		case "PLC":
+			f.opt.PLC = cookie.Value
+		case "validationKey":
+			f.opt.ValidationKey = cookie.Value
+		}
+	}
+	if f.opt.JSessionID == "" {
+		return errors.New("O2 session renewal did not return JSESSIONID")
+	}
+	if f.opt.PLC == "" {
+		return errors.New("O2 session renewal did not return PLC")
+	}
+	f.saveSession()
+	return nil
 }
 
 func redactedURL(raw string) string {

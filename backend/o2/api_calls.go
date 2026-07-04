@@ -159,32 +159,6 @@ func (f *Fs) deleteFolder(ctx context.Context, id int64) error {
 	return f.doJSON(ctx, http.MethodPost, f.opt.APIURL+"/sapi/media/folder?action=softdelete", in, nil)
 }
 
-func (f *Fs) waitUploadValidated(ctx context.Context, id string) error {
-	numericID, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		return err
-	}
-
-	in := map[string]any{"data": map[string]any{"ids": []map[string]int64{{"id": numericID}}}}
-	for i := 0; i < 5; i++ {
-		var env api.Envelope
-		if err := f.doJSON(ctx, http.MethodPost, f.opt.APIURL+"/sapi/media?action=get-validation-status", in, &env); err != nil {
-			return err
-		}
-		if len(env.Data.IDs) > 0 {
-			status := env.Data.IDs[0].Status
-			fs.Debugf(f, "O2 upload id=%s validation status=%s", id, status)
-			if status != "" {
-				return nil
-			}
-		}
-		if err := sleepWithContext(ctx, time.Second); err != nil {
-			return err
-		}
-	}
-	return fmt.Errorf("O2 upload id=%s validation did not reach a usable state", id)
-}
-
 func (f *Fs) waitMedia(ctx context.Context, id string) (api.Media, error) {
 	var lastErr error
 	for i := 0; i < 10; i++ {
