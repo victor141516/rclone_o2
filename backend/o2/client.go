@@ -46,9 +46,17 @@ func shouldRetry(ctx context.Context, resp *http.Response, err error) (bool, err
 }
 
 func (f *Fs) addHeaders(req *http.Request) {
+	f.addCommonHeaders(req)
+	f.addSessionCookies(req)
+}
+
+func (f *Fs) addCommonHeaders(req *http.Request) {
 	req.Header.Set("X-deviceid", f.opt.DeviceID)
 	req.Header.Set("Referer", f.opt.APIURL+"/")
 	req.Header.Set("Origin", f.opt.APIURL)
+}
+
+func (f *Fs) addSessionCookies(req *http.Request) {
 	if f.opt.ValidationKey != "" {
 		req.AddCookie(&http.Cookie{Name: "validationKey", Value: f.opt.ValidationKey})
 	}
@@ -57,6 +65,12 @@ func (f *Fs) addHeaders(req *http.Request) {
 	}
 	if f.opt.PLC != "" {
 		req.AddCookie(&http.Cookie{Name: "PLC", Value: f.opt.PLC})
+	}
+}
+
+func (f *Fs) addUploadCookie(req *http.Request) {
+	if f.opt.JSessionID != "" {
+		req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
 	}
 }
 
