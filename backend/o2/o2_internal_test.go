@@ -97,33 +97,27 @@ func TestAuthFormBodyPreservesBrowserOrder(t *testing.T) {
 	}
 }
 
-func TestUploadMetadataMatchesBrowserAudioShape(t *testing.T) {
-	got, err := uploadMetadata("song.m4a", 42, 123, "audio/mp4")
-	if err != nil {
-		t.Fatal(err)
-	}
+func TestUploadMetadataUsesBrowserShapeForAllTypes(t *testing.T) {
+	for _, name := range []string{"song.m4a", "note.txt", "program.exe", "random.unknownext"} {
+		got, err := uploadMetadata(name, 42, 123)
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	var payload map[string]map[string]any
-	if err := json.Unmarshal(got, &payload); err != nil {
-		t.Fatal(err)
-	}
-	data := payload["data"]
-	if data["modificationdate"] != "" {
-		t.Fatalf("modificationdate = %q", data["modificationdate"])
-	}
-	if _, ok := data["contenttype"]; ok {
-		t.Fatal("audio contenttype should be omitted like the browser")
-	}
-
-	got, err = uploadMetadata("note.txt", 42, 123, "text/plain")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := json.Unmarshal(got, &payload); err != nil {
-		t.Fatal(err)
-	}
-	if payload["data"]["contenttype"] != "text/plain" {
-		t.Fatalf("contenttype = %q, want text/plain", payload["data"]["contenttype"])
+		var payload map[string]map[string]any
+		if err := json.Unmarshal(got, &payload); err != nil {
+			t.Fatal(err)
+		}
+		data := payload["data"]
+		if data["name"] != name {
+			t.Fatalf("name = %q, want %q", data["name"], name)
+		}
+		if data["modificationdate"] != "" {
+			t.Fatalf("modificationdate = %q", data["modificationdate"])
+		}
+		if _, ok := data["contenttype"]; ok {
+			t.Fatalf("%s metadata should not include contenttype", name)
+		}
 	}
 }
 
@@ -661,25 +655,36 @@ func TestUploadRequestUsesAsyncForLargeFiles(t *testing.T) {
 	}
 }
 
-func TestUploadBodyUsesBrowserM4AFileContentType(t *testing.T) {
-	body, contentType, _, err := newUploadBody([]byte(`{"data":{}}`), "song.M4A", int64(len("payload")), "audio/mpeg", strings.NewReader("payload"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, params, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		t.Fatal(err)
-	}
-	form, err := multipart.NewReader(body, params["boundary"]).ReadForm(1024)
-	if err != nil {
-		t.Fatal(err)
-	}
-	files := form.File["file"]
-	if len(files) != 1 {
-		t.Fatalf("file parts = %d, want 1", len(files))
-	}
-	if got := files[0].Header.Get("Content-Type"); got != "audio/x-m4a" {
-		t.Fatalf("file part Content-Type = %q, want audio/x-m4a", got)
+func TestUploadBodyUsesGenericFileContentType(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		mimeType string
+		want     string
+	}{
+		{name: "song.m4a", mimeType: "audio/mp4", want: "audio/mp4"},
+		{name: "note.txt", mimeType: "text/plain", want: "text/plain"},
+		{name: "program.exe", mimeType: "application/x-msdownload", want: "application/x-msdownload"},
+		{name: "random.unknownext", mimeType: "", want: "application/octet-stream"},
+	} {
+		body, contentType, _, err := newUploadBody([]byte(`{"data":{}}`), test.name, int64(len("payload")), test.mimeType, strings.NewReader("payload"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, params, err := mime.ParseMediaType(contentType)
+		if err != nil {
+			t.Fatal(err)
+		}
+		form, err := multipart.NewReader(body, params["boundary"]).ReadForm(1024)
+		if err != nil {
+			t.Fatal(err)
+		}
+		files := form.File["file"]
+		if len(files) != 1 {
+			t.Fatalf("%s file parts = %d, want 1", test.name, len(files))
+		}
+		if got := files[0].Header.Get("Content-Type"); got != test.want {
+			t.Fatalf("%s file part Content-Type = %q, want %q", test.name, got, test.want)
+		}
 	}
 }
 
