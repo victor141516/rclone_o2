@@ -60,7 +60,7 @@ func (f *Fs) listFolders(ctx context.Context, folderID int64) ([]api.Folder, err
 }
 
 func (f *Fs) listMedia(ctx context.Context, folderID int64) ([]api.Media, error) {
-	in := map[string]any{"data": map[string]any{"fields": defaultListFields()}}
+	in := map[string]any{"data": map[string]any{"fields": defaultListFields}}
 	var env api.Envelope
 	u := fmt.Sprintf("%s/sapi/media?action=get&folderid=%d&limit=200", f.opt.APIURL, folderID)
 	if err := f.doJSON(ctx, http.MethodPost, u, in, &env); err != nil {
@@ -130,7 +130,7 @@ func (f *Fs) getMedia(ctx context.Context, id string) (api.Media, error) {
 
 	in := map[string]any{"data": map[string]any{
 		"ids":    []int64{numericID},
-		"fields": fullMediaFields(),
+		"fields": fullMediaFields,
 	}}
 	var env api.Envelope
 	if err := f.doJSON(ctx, http.MethodPost, f.opt.APIURL+"/sapi/media?action=get&origin=omh,dropbox", in, &env); err != nil {
@@ -188,10 +188,6 @@ func sleepWithContext(ctx context.Context, duration time.Duration) error {
 	}
 }
 
-func defaultListFields() []string {
-	return []string{"name", "modificationdate", "size", "thumbnails", "videometadata", "audiometadata", "favorite", "shared", "etag"}
-}
+var defaultListFields = []string{"name", "modificationdate", "size", "thumbnails", "videometadata", "audiometadata", "favorite", "shared", "etag"}
 
-func fullMediaFields() []string {
-	return []string{"creationdate", "postingdate", "name", "size", "thumbnails", "viewurl", "url", "videometadata", "audiometadata", "shared", "exported", "favorite", "origin", "folderid", "labels", "modificationdate", "uploadeddeviceid", "uploaded", "etag"}
-}
+var fullMediaFields = []string{"creationdate", "postingdate", "name", "size", "thumbnails", "viewurl", "url", "videometadata", "audiometadata", "shared", "exported", "favorite", "origin", "folderid", "labels", "modificationdate", "uploadeddeviceid", "uploaded", "etag"}
