@@ -15,19 +15,19 @@ type Envelope struct {
 type Error struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+	Data    string `json:"data"`
 }
 
 // Data carries response payloads.
 type Data struct {
-	Folder  *Folder          `json:"folder"`
-	Folders []Folder         `json:"folders"`
-	Media   []Media          `json:"media"`
-	IDs     []ValidationItem `json:"ids"`
-	Quota   int64            `json:"quota"`
-	Free    int64            `json:"free"`
-	Used    int64            `json:"used"`
-	Deleted int64            `json:"softdeleted"`
-	NoLimit bool             `json:"nolimit"`
+	Folder  *Folder  `json:"folder"`
+	Folders []Folder `json:"folders"`
+	Media   []Media  `json:"media"`
+	Quota   int64    `json:"quota"`
+	Free    int64    `json:"free"`
+	Used    int64    `json:"used"`
+	Deleted int64    `json:"softdeleted"`
+	NoLimit bool     `json:"nolimit"`
 
 	AuthorizationURL string `json:"authorizationurl"`
 	ValidationKey    string `json:"validationkey"`
@@ -69,12 +69,6 @@ type Media struct {
 // Origin describes where a media item came from.
 type Origin struct {
 	Name string `json:"name"`
-}
-
-// ValidationItem is returned by the post-upload validation status endpoint.
-type ValidationItem struct {
-	ID     int64  `json:"id"`
-	Status string `json:"status"`
 }
 
 // UploadResponse is returned by the upload host.

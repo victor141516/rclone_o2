@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/http/cookiejar"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/rclone/rclone/fs"
@@ -37,21 +37,10 @@ func init() {
 		Name:        "o2",
 		Description: "O2 Cloud",
 		NewFs:       NewFs,
+		Config:      Config,
 		Options: []fs.Option{{
-			Name:       "validation_key",
-			Help:       "O2 Cloud validationKey cookie from a logged-in browser session.\n\nLog in at https://cloud.o2online.es/ in your browser, open the developer tools for cloud.o2online.es, and copy the cookie named validationKey.",
-			Sensitive:  true,
-			IsPassword: true,
-			Required:   true,
-		}, {
-			Name:       "jsessionid",
-			Help:       "O2 Cloud JSESSIONID cookie from the same logged-in browser session.\n\nIn browser developer tools, inspect cookies for https://cloud.o2online.es/ and copy the cookie named JSESSIONID.",
-			Sensitive:  true,
-			IsPassword: true,
-			Required:   true,
-		}, {
-			Name:     "device_id",
-			Help:     "O2 Cloud web device id from the same logged-in browser session.\n\nIn browser developer tools, check local storage for cloud.o2online.es and copy the value of omhls.fingerprintKey. If the value does not start with web-, rclone will add that prefix.",
+			Name:     "phone_number",
+			Help:     "O2 phone number used to receive the login SMS.\n\nUse international format, for example +34600111222, or a Spanish mobile number.",
 			Required: true,
 		}, {
 			Name:     "root_folder_id",
@@ -78,8 +67,10 @@ func init() {
 
 // Options defines the configuration for this backend.
 type Options struct {
+	PhoneNumber   string               `config:"phone_number"`
 	ValidationKey string               `config:"validation_key"`
 	JSessionID    string               `config:"jsessionid"`
+	PLC           string               `config:"plc"`
 	DeviceID      string               `config:"device_id"`
 	RootFolderID  string               `config:"root_folder_id"`
 	APIURL        string               `config:"api_url"`
@@ -92,11 +83,13 @@ type Fs struct {
 	name     string
 	root     string
 	opt      Options
+	m        configmap.Mapper
 	features *fs.Features
 	client   *http.Client
 	pacer    *fs.Pacer
 	dirCache *dircache.DirCache
 	rootID   string
+	authMu   sync.Mutex
 }
 
 // Object describes an O2 Cloud object.
@@ -123,6 +116,7 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 		name:   name,
 		root:   parsePath(root),
 		opt:    opt,
+		m:      m,
 		client: newHTTPClient(ctx),
 		pacer:  newPacer(ctx),
 	}
@@ -145,29 +139,42 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 }
 
 func readOptions(m configmap.Mapper) (Options, error) {
+	opt, err := readOptionsUnchecked(m)
+	if err != nil {
+		return Options{}, err
+	}
+	if err := opt.validate(); err != nil {
+		return Options{}, err
+	}
+	return opt, nil
+}
+
+func readOptionsUnchecked(m configmap.Mapper) (Options, error) {
 	opt := new(Options)
 	if err := configstruct.Set(m, opt); err != nil {
 		return Options{}, err
 	}
 
+	opt.PhoneNumber = normalizePhoneNumber(opt.PhoneNumber)
 	opt.ValidationKey = revealValidationKey(opt.ValidationKey)
 	opt.JSessionID = revealJSessionID(opt.JSessionID)
+	opt.PLC = revealIfObscured(opt.PLC)
 	opt.DeviceID = normalizeDeviceID(opt.DeviceID)
 	opt.APIURL = strings.TrimRight(opt.APIURL, "/")
 	opt.UploadURL = strings.TrimRight(opt.UploadURL, "/")
 
-	if err := opt.validate(); err != nil {
-		return Options{}, err
-	}
 	return *opt, nil
 }
 
 func (opt Options) validate() error {
-	if opt.ValidationKey == "" || opt.JSessionID == "" {
-		return errors.New("O2 Cloud browser session credentials missing; run \"rclone config reconnect\" and paste validationKey and JSESSIONID from a logged-in browser")
+	if opt.PhoneNumber == "" {
+		return errors.New("O2 Cloud phone number missing; run \"rclone config reconnect\" to authenticate with SMS")
+	}
+	if opt.ValidationKey == "" || opt.JSessionID == "" || opt.PLC == "" {
+		return errors.New("O2 Cloud session missing; run \"rclone config reconnect\" to authenticate with SMS")
 	}
 	if opt.DeviceID == "" {
-		return errors.New("O2 Cloud device_id missing; copy omhls.fingerprintKey from browser local storage for cloud.o2online.es")
+		return errors.New("O2 Cloud device id missing; run \"rclone config reconnect\" to authenticate with SMS")
 	}
 	return nil
 }
@@ -177,10 +184,7 @@ func parsePath(root string) string {
 }
 
 func newHTTPClient(ctx context.Context) *http.Client {
-	jar, _ := cookiejar.New(nil)
-	client := fshttp.NewClient(ctx)
-	client.Jar = jar
-	return client
+	return fshttp.NewClient(ctx)
 }
 
 func newPacer(ctx context.Context) *fs.Pacer {

@@ -1,9 +1,12 @@
 package o2
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +31,7 @@ import (
 func TestRevealO2Secrets(t *testing.T) {
 	validationKey := "24553931775f412a57804d272b305848"
 	jsessionid := "2D4F6F492842ADB18DEB929ACE9984E8.1i221"
+	plc := "persistent-login-cookie"
 
 	if got := revealValidationKey(validationKey); got != validationKey {
 		t.Fatalf("raw validation key changed to %q", got)
@@ -40,6 +44,9 @@ func TestRevealO2Secrets(t *testing.T) {
 	}
 	if got := revealJSessionID(obscure.MustObscure(jsessionid)); got != jsessionid {
 		t.Fatalf("obscured JSESSIONID revealed as %q", got)
+	}
+	if got := revealIfObscured(obscure.MustObscure(plc)); got != plc {
+		t.Fatalf("obscured PLC revealed as %q", got)
 	}
 }
 
@@ -59,17 +66,160 @@ func TestNormalizeDeviceID(t *testing.T) {
 	}
 }
 
-func TestBackendConfigAllBrowserSessionCompletes(t *testing.T) {
+func TestNormalizePhoneNumber(t *testing.T) {
+	for _, test := range []struct {
+		in   string
+		want string
+	}{
+		{in: "", want: ""},
+		{in: "636025908", want: "34636025908"},
+		{in: "+34 636 025 908", want: "34636025908"},
+		{in: "0034-636-025-908", want: "34636025908"},
+	} {
+		if got := normalizePhoneNumber(test.in); got != test.want {
+			t.Fatalf("normalizePhoneNumber(%q) = %q, want %q", test.in, got, test.want)
+		}
+	}
+}
+
+func TestAuthFormBodyPreservesBrowserOrder(t *testing.T) {
+	got := formBody(
+		"csrfmiddlewaretoken", "csrf-token",
+		"corr", "corr-1",
+		"nonce", "nonce-1",
+		"trans", "trans-1",
+		"code", "1234",
+		"action", "finish",
+	)
+	want := "csrfmiddlewaretoken=csrf-token&corr=corr-1&nonce=nonce-1&trans=trans-1&code=1234&action=finish"
+	if got != want {
+		t.Fatalf("formBody = %q, want %q", got, want)
+	}
+}
+
+func TestUploadMetadataMatchesBrowserAudioShape(t *testing.T) {
+	got, err := uploadMetadata("song.m4a", 42, 123, "audio/mp4")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatal(err)
+	}
+	data := payload["data"]
+	if data["modificationdate"] != "" {
+		t.Fatalf("modificationdate = %q", data["modificationdate"])
+	}
+	if _, ok := data["contenttype"]; ok {
+		t.Fatal("audio contenttype should be omitted like the browser")
+	}
+
+	got, err = uploadMetadata("note.txt", 42, 123, "text/plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["data"]["contenttype"] != "text/plain" {
+		t.Fatalf("contenttype = %q, want text/plain", payload["data"]["contenttype"])
+	}
+}
+
+func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 	ri, err := fs.Find("o2")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	m := configmap.Simple{"type": "o2"}
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/sapi/login/mobileconnect" && r.URL.Query().Get("action") == "start":
+			if got := r.Header.Get("X-deviceid"); !strings.HasPrefix(got, "web-") {
+				t.Fatalf("start X-deviceid = %q, want web-*", got)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Form.Get("msisdn"); got != "34636025908" {
+				t.Fatalf("msisdn = %q, want normalized phone", got)
+			}
+			if got := r.Form.Get("rememberme"); got != "true" {
+				t.Fatalf("rememberme = %q, want true", got)
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{AuthorizationURL: server.URL + "/es/oauth2/authorize?state=state-1"}})
+
+		case r.URL.Path == "/es/oauth2/authorize":
+			http.SetCookie(w, &http.Cookie{Name: "connect.sid", Value: "connect-cookie", Path: "/"})
+			http.Redirect(w, r, "/es/sba/authenticate?jwt=test", http.StatusFound)
+
+		case r.URL.Path == "/es/sba/authenticate":
+			http.SetCookie(w, &http.Cookie{Name: "xbacsrftoken", Value: "csrf-cookie", Path: "/"})
+			_, _ = w.Write([]byte(`<html><form action="/es/sba/finish" method="post">
+				<input type="hidden" name="csrfmiddlewaretoken" value="csrf-token">
+				<input type="hidden" name="corr" value="corr-1">
+				<input type="hidden" name="nonce" value="nonce-1">
+				<input type="hidden" name="trans" value="trans-1">
+				<input type="hidden" name="code" value="">
+			</form></html>`))
+
+		case r.URL.Path == "/es/sba/finish":
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Form.Get("code"); got != "1234" {
+				t.Fatalf("SMS code = %q, want 1234", got)
+			}
+			if got := r.Header.Get("X-CSRFToken"); got != "csrf-token" {
+				t.Fatalf("X-CSRFToken = %q, want csrf-token", got)
+			}
+			http.Redirect(w, r, "/es/authrouter/authenticated?jwt=authenticated", http.StatusFound)
+
+		case r.URL.Path == "/es/authrouter/authenticated":
+			if got, err := r.Cookie("connect.sid"); err != nil || got.Value != "connect-cookie" {
+				t.Fatalf("authenticated connect.sid cookie = %v, %v; want connect-cookie", got, err)
+			}
+			http.Redirect(w, r, "/es/oauth2/authorize/confirm?jwt=confirm", http.StatusFound)
+
+		case r.URL.Path == "/es/oauth2/authorize/confirm":
+			if got, err := r.Cookie("connect.sid"); err != nil || got.Value != "connect-cookie" {
+				t.Fatalf("confirm connect.sid cookie = %v, %v; want connect-cookie", got, err)
+			}
+			http.Redirect(w, r, "/ui/html/mobileconnect.html?code=auth-code&state=callback-state", http.StatusFound)
+
+		case r.URL.Path == "/ui/html/mobileconnect.html":
+			_, _ = w.Write([]byte("ok"))
+
+		case r.URL.Path == "/sapi/login/mobileconnect" && r.URL.Query().Get("action") == "login":
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			if got := r.Form.Get("keytype"); got != "authorizationcode" {
+				t.Fatalf("keytype = %q, want authorizationcode", got)
+			}
+			if got := r.Form.Get("state"); got != "callback-state" {
+				t.Fatalf("state = %q, want callback-state", got)
+			}
+			if got := r.Form.Get("key"); got != "auth-code" {
+				t.Fatalf("key = %q, want auth-code", got)
+			}
+			http.SetCookie(w, &http.Cookie{Name: "validationKey", Value: "validation-new", Path: "/"})
+			http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "session-new", Path: "/"})
+			http.SetCookie(w, &http.Cookie{Name: "PLC", Value: "plc-new", Path: "/"})
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{ValidationKey: "validation-new"}})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	m := configmap.Simple{"type": "o2", "api_url": server.URL, "upload_url": server.URL}
 	choices := configmap.Simple{
-		"validation_key":     "24553931775f412a57804d272b305848",
-		"jsessionid":         "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
-		"device_id":          "web-test-device",
+		"phone_number":       "636 025 908",
+		"config_sms_code":    "1234",
 		"config_fs_advanced": "false",
 	}
 	out, err := fs.BackendConfig(context.Background(), "o2test", m, ri, choices, fs.ConfigIn{State: fs.ConfigAll})
@@ -79,13 +229,140 @@ func TestBackendConfigAllBrowserSessionCompletes(t *testing.T) {
 	if out != nil {
 		t.Fatalf("out = %#v", out)
 	}
-	for key, want := range choices {
-		if key == "config_fs_advanced" {
-			continue
+	if got := m["phone_number"]; got != "34636025908" {
+		t.Fatalf("phone_number = %q, want normalized phone", got)
+	}
+	if got := revealIfObscured(m["validation_key"]); got != "validation-new" {
+		t.Fatalf("validation_key = %q, want validation-new", got)
+	}
+	if got := revealIfObscured(m["jsessionid"]); got != "session-new" {
+		t.Fatalf("jsessionid = %q, want session-new", got)
+	}
+	if got := revealIfObscured(m["plc"]); got != "plc-new" {
+		t.Fatalf("plc = %q, want plc-new", got)
+	}
+	if got := m["device_id"]; !strings.HasPrefix(got, "web-") {
+		t.Fatalf("device_id = %q, want web-*", got)
+	}
+}
+
+func TestAPIRenewsExpiredSessionAndSavesIt(t *testing.T) {
+	ctx := context.Background()
+	var requests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/media/folder/root" || r.URL.Query().Get("action") != "get" {
+			http.NotFound(w, r)
+			return
 		}
-		if got := m[key]; got != want {
-			t.Fatalf("%s = %q, want %q", key, got, want)
+		requests++
+		switch requests {
+		case 1:
+			if got := r.URL.Query().Get("validationkey"); got != "validation-old" {
+				t.Fatalf("first validationkey = %q, want validation-old", got)
+			}
+			if got, err := r.Cookie("validationKey"); err != nil || got.Value != "validation-old" {
+				t.Fatalf("first validationKey cookie = %v, %v; want validation-old", got, err)
+			}
+			if got, err := r.Cookie("PLC"); err != nil || got.Value != "plc-old" {
+				t.Fatalf("first PLC cookie = %v, %v; want plc-old", got, err)
+			}
+			http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "session-new", Path: "/"})
+			http.SetCookie(w, &http.Cookie{Name: "PLC", Value: "plc-new", Path: "/"})
+			w.WriteHeader(http.StatusUnauthorized)
+			_ = json.NewEncoder(w).Encode(api.Envelope{Error: &api.Error{
+				Code:    "SEC-1003",
+				Message: "expired",
+				Data:    "validation-new",
+			}})
+		case 2:
+			if got := r.URL.Query().Get("validationkey"); got != "validation-new" {
+				t.Fatalf("second validationkey = %q, want validation-new", got)
+			}
+			for name, want := range map[string]string{
+				"validationKey": "validation-new",
+				"JSESSIONID":    "session-new",
+				"PLC":           "plc-new",
+			} {
+				got, err := r.Cookie(name)
+				if err != nil || got.Value != want {
+					t.Fatalf("second %s cookie = %v, %v; want %s", name, got, err, want)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "/", ID: 42}}}})
+		case 3:
+			if got := r.URL.Query().Get("validationkey"); got != "validation-new" {
+				t.Fatalf("third validationkey = %q, want validation-new", got)
+			}
+			for name, want := range map[string]string{
+				"validationKey": "validation-new",
+				"JSESSIONID":    "session-new",
+				"PLC":           "plc-new",
+			} {
+				got, err := r.Cookie(name)
+				if err != nil || got.Value != want {
+					t.Fatalf("third %s cookie = %v, %v; want %s", name, got, err, want)
+				}
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "/", ID: 43}}}})
+		default:
+			t.Fatalf("unexpected request %d", requests)
 		}
+	}))
+	defer server.Close()
+
+	m := configmap.Simple{"phone_number": "34636025908", "api_url": server.URL, "upload_url": server.URL}
+	f := &Fs{
+		name: "o2test",
+		opt: Options{
+			ValidationKey: "validation-old",
+			PLC:           "plc-old",
+			DeviceID:      "web-test-device",
+			APIURL:        server.URL,
+			UploadURL:     server.URL,
+			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
+		},
+		m:      m,
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+
+	id, err := f.readRootFolderID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 42 {
+		t.Fatalf("root id = %d, want 42", id)
+	}
+	if got := revealIfObscured(m["validation_key"]); got != "validation-new" {
+		t.Fatalf("saved validation_key = %q, want validation-new", got)
+	}
+	if got := revealIfObscured(m["jsessionid"]); got != "session-new" {
+		t.Fatalf("saved jsessionid = %q, want session-new", got)
+	}
+	if got := revealIfObscured(m["plc"]); got != "plc-new" {
+		t.Fatalf("saved plc = %q, want plc-new", got)
+	}
+	if got := m["device_id"]; got != "web-test-device" {
+		t.Fatalf("saved device_id = %q, want web-test-device", got)
+	}
+
+	opt, err := readOptions(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f2 := &Fs{
+		name:   "o2test",
+		opt:    opt,
+		m:      m,
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	id, err = f2.readRootFolderID(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if id != 43 {
+		t.Fatalf("second Fs root id = %d, want 43", id)
 	}
 }
 
@@ -264,6 +541,145 @@ func TestVFSReadAtUsesRangeOptions(t *testing.T) {
 	}
 	if len(ranges) != 2 || ranges[0] != "bytes=0-3" || ranges[1] != "bytes=9-9" {
 		t.Fatalf("ranges = %#v, want [bytes=0-3 bytes=9-9]", ranges)
+	}
+}
+
+func TestUploadSendsKnownLengthMultipartBodyAndReturnsAcceptedObject(t *testing.T) {
+	const payload = "payload"
+
+	var uploadRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/upload" || r.URL.Query().Get("action") != "save" {
+			t.Fatalf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		uploadRequests++
+		if r.ContentLength <= int64(len(payload)) {
+			t.Fatalf("ContentLength = %d, want multipart body with known length", r.ContentLength)
+		}
+		if len(r.TransferEncoding) != 0 {
+			t.Fatalf("TransferEncoding = %#v, want no chunked transfer", r.TransferEncoding)
+		}
+		cookies := r.Cookies()
+		if len(cookies) != 1 || cookies[0].Name != "JSESSIONID" || cookies[0].Value != "2D4F6F492842ADB18DEB929ACE9984E8.1i221" {
+			t.Fatalf("upload cookies = %#v, want JSESSIONID only", cookies)
+		}
+
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if int64(len(body)) != r.ContentLength {
+			t.Fatalf("body length = %d, want ContentLength %d", len(body), r.ContentLength)
+		}
+
+		mediaType, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mediaType != "multipart/form-data" {
+			t.Fatalf("Content-Type = %q, want multipart/form-data", mediaType)
+		}
+		form, err := multipart.NewReader(bytes.NewReader(body), params["boundary"]).ReadForm(int64(len(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := len(form.Value["data"]); got != 1 {
+			t.Fatalf("data fields = %d, want 1", got)
+		}
+		files := form.File["file"]
+		if len(files) != 1 {
+			t.Fatalf("file parts = %d, want 1", len(files))
+		}
+		if got := files[0].Header.Get("Content-Type"); got != "text/plain; charset=utf-8" {
+			t.Fatalf("file part Content-Type = %q, want text/plain; charset=utf-8", got)
+		}
+		file, err := files[0].Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer fs.CheckClose(file, &err)
+		gotPayload, err := io.ReadAll(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(gotPayload) != payload {
+			t.Fatalf("file payload = %q, want %q", gotPayload, payload)
+		}
+
+		_ = json.NewEncoder(w).Encode(api.UploadResponse{Success: "true", ID: "123", Status: "V", ETag: "etag-1"})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	f := &Fs{
+		name: "o2test",
+		opt: Options{
+			ValidationKey: "24553931775f412a57804d272b305848",
+			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
+			PLC:           "persistent-login-cookie",
+			DeviceID:      "web-test-device",
+			APIURL:        server.URL,
+			UploadURL:     server.URL,
+			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
+		},
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.dirCache = dircache.New("", "1", f)
+
+	src := object.NewStaticObjectInfo("upload.txt", time.Now(), int64(len(payload)), true, nil, f)
+	obj, err := f.upload(ctx, strings.NewReader(payload), src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotObj := obj.(*Object)
+	if gotObj.id != "123" || gotObj.size != int64(len(payload)) || gotObj.etag != "etag-1" {
+		t.Fatalf("uploaded object = id %q size %d etag %q", gotObj.id, gotObj.size, gotObj.etag)
+	}
+	if uploadRequests != 1 {
+		t.Fatalf("upload requests = %d, want 1", uploadRequests)
+	}
+}
+
+func TestUploadRequestUsesAsyncForLargeFiles(t *testing.T) {
+	ctx := context.Background()
+	f := &Fs{
+		opt: Options{
+			ValidationKey: "validation",
+			DeviceID:      "web-test-device",
+			APIURL:        "https://cloud.o2online.es",
+			UploadURL:     "https://upload.cloud.o2online.es",
+		},
+	}
+
+	req, err := f.newUploadRequest(ctx, []byte(`{"data":{}}`), "large.bin", minAsyncUploadFileSizeBytes+1, "application/octet-stream", strings.NewReader(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := req.URL.Query().Get("acceptasynchronous"); got != "true" {
+		t.Fatalf("acceptasynchronous = %q, want true", got)
+	}
+}
+
+func TestUploadBodyUsesBrowserM4AFileContentType(t *testing.T) {
+	body, contentType, _, err := newUploadBody([]byte(`{"data":{}}`), "song.m4a", int64(len("payload")), "audio/mpeg", strings.NewReader("payload"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		t.Fatal(err)
+	}
+	form, err := multipart.NewReader(body, params["boundary"]).ReadForm(1024)
+	if err != nil {
+		t.Fatal(err)
+	}
+	files := form.File["file"]
+	if len(files) != 1 {
+		t.Fatalf("file parts = %d, want 1", len(files))
+	}
+	if got := files[0].Header.Get("Content-Type"); got != "audio/x-m4a" {
+		t.Fatalf("file part Content-Type = %q, want audio/x-m4a", got)
 	}
 }
 
