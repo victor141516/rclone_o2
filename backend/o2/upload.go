@@ -18,6 +18,13 @@ import (
 var multipartQuoteReplacer = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
 
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if err := f.refreshUploadSessionBeforeUpload(ctx); err != nil {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		fs.Debugf(f, "O2 session refresh before upload failed; continuing with existing session: %v", err)
+	}
+
 	leaf, folderID, err := f.parentFolderID(ctx, src.Remote(), true)
 	if err != nil {
 		return nil, err
@@ -81,6 +88,7 @@ func (f *Fs) newUploadRequest(ctx context.Context, metadata []byte, fileName str
 	f.addUploadCookie(req)
 	req.Header.Set("Content-Type", contentType)
 	req.Header.Set("Accept", "*/*")
+	addFetchHeaders(req, "same-site")
 	if contentLength >= 0 {
 		req.ContentLength = contentLength
 	}

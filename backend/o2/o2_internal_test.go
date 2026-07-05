@@ -82,6 +82,18 @@ func TestNormalizePhoneNumber(t *testing.T) {
 	}
 }
 
+func TestSessionNode(t *testing.T) {
+	if got := sessionNode("ABC.1i221"); got != "1i221" {
+		t.Fatalf("sessionNode = %q, want 1i221", got)
+	}
+	if got := sessionNode("ABC"); got != "" {
+		t.Fatalf("sessionNode without suffix = %q, want empty", got)
+	}
+	if got := sessionNode("ABC."); got != "" {
+		t.Fatalf("sessionNode with empty suffix = %q, want empty", got)
+	}
+}
+
 func TestAuthFormBodyPreservesBrowserOrder(t *testing.T) {
 	got := formBody(
 		"csrfmiddlewaretoken", "csrf-token",
@@ -538,11 +550,50 @@ func TestVFSReadAtUsesRangeOptions(t *testing.T) {
 	}
 }
 
-func TestUploadSendsKnownLengthMultipartBodyAndReturnsAcceptedObject(t *testing.T) {
+func TestUploadRefreshesSessionWhenConfiguredAndSendsKnownLengthMultipartBody(t *testing.T) {
 	const payload = "payload"
 
+	var renewalRequests int
 	var uploadRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sapi/media/folder/root" && r.URL.Query().Get("action") == "get" {
+			renewalRequests++
+			switch renewalRequests {
+			case 1:
+				if _, err := r.Cookie("JSESSIONID"); err == nil {
+					t.Fatal("renewal request should omit JSESSIONID")
+				}
+				if got, err := r.Cookie("validationKey"); err != nil || got.Value != "24553931775f412a57804d272b305848" {
+					t.Fatalf("renewal validationKey cookie = %v, %v", got, err)
+				}
+				if got, err := r.Cookie("PLC"); err != nil || got.Value != "persistent-login-cookie" {
+					t.Fatalf("renewal PLC cookie = %v, %v", got, err)
+				}
+				http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "renewed-session", Path: "/"})
+				http.SetCookie(w, &http.Cookie{Name: "PLC", Value: "renewed-plc", Path: "/"})
+				w.WriteHeader(http.StatusUnauthorized)
+				_ = json.NewEncoder(w).Encode(api.Envelope{Error: &api.Error{
+					Code:    "SEC-1003",
+					Message: "expired",
+					Data:    "renewed-validation",
+				}})
+			case 2:
+				for name, want := range map[string]string{
+					"validationKey": "renewed-validation",
+					"JSESSIONID":    "renewed-session",
+					"PLC":           "renewed-plc",
+				} {
+					got, err := r.Cookie(name)
+					if err != nil || got.Value != want {
+						t.Fatalf("verified %s cookie = %v, %v; want %s", name, got, err, want)
+					}
+				}
+				_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "/", ID: 1}}}})
+			default:
+				t.Fatalf("unexpected renewal request %d", renewalRequests)
+			}
+			return
+		}
 		if r.URL.Path != "/sapi/upload" || r.URL.Query().Get("action") != "save" {
 			t.Fatalf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
 		}
@@ -554,8 +605,8 @@ func TestUploadSendsKnownLengthMultipartBodyAndReturnsAcceptedObject(t *testing.
 			t.Fatalf("TransferEncoding = %#v, want no chunked transfer", r.TransferEncoding)
 		}
 		cookies := r.Cookies()
-		if len(cookies) != 1 || cookies[0].Name != "JSESSIONID" || cookies[0].Value != "2D4F6F492842ADB18DEB929ACE9984E8.1i221" {
-			t.Fatalf("upload cookies = %#v, want JSESSIONID only", cookies)
+		if len(cookies) != 1 || cookies[0].Name != "JSESSIONID" || cookies[0].Value != "renewed-session" {
+			t.Fatalf("upload cookies = %#v, want renewed JSESSIONID only", cookies)
 		}
 
 		body, err := io.ReadAll(r.Body)
@@ -608,13 +659,14 @@ func TestUploadSendsKnownLengthMultipartBodyAndReturnsAcceptedObject(t *testing.
 	f := &Fs{
 		name: "o2test",
 		opt: Options{
-			ValidationKey: "24553931775f412a57804d272b305848",
-			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
-			PLC:           "persistent-login-cookie",
-			DeviceID:      "web-test-device",
-			APIURL:        server.URL,
-			UploadURL:     server.URL,
-			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
+			ValidationKey:        "24553931775f412a57804d272b305848",
+			JSessionID:           "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
+			PLC:                  "persistent-login-cookie",
+			DeviceID:             "web-test-device",
+			APIURL:               server.URL,
+			UploadURL:            server.URL,
+			RefreshUploadSession: true,
+			Enc:                  encoder.Display | encoder.EncodeInvalidUtf8,
 		},
 		client: server.Client(),
 		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
@@ -632,6 +684,64 @@ func TestUploadSendsKnownLengthMultipartBodyAndReturnsAcceptedObject(t *testing.
 	}
 	if uploadRequests != 1 {
 		t.Fatalf("upload requests = %d, want 1", uploadRequests)
+	}
+	if renewalRequests != 2 {
+		t.Fatalf("renewal requests = %d, want 2", renewalRequests)
+	}
+}
+
+func TestUploadDoesNotRefreshSessionByDefault(t *testing.T) {
+	const payload = "payload"
+
+	var renewalRequests int
+	var uploadRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sapi/media/folder/root" && r.URL.Query().Get("action") == "get" {
+			renewalRequests++
+			http.NotFound(w, r)
+			return
+		}
+		if r.URL.Path != "/sapi/upload" || r.URL.Query().Get("action") != "save" {
+			t.Fatalf("unexpected request %s?%s", r.URL.Path, r.URL.RawQuery)
+		}
+		uploadRequests++
+		cookies := r.Cookies()
+		if len(cookies) != 1 || cookies[0].Name != "JSESSIONID" || cookies[0].Value != "2D4F6F492842ADB18DEB929ACE9984E8.1i221" {
+			t.Fatalf("upload cookies = %#v, want original JSESSIONID only", cookies)
+		}
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Fatal(err)
+		}
+		_ = json.NewEncoder(w).Encode(api.UploadResponse{Success: "true", ID: "123", Status: "V", ETag: "etag-1"})
+	}))
+	defer server.Close()
+
+	ctx := context.Background()
+	f := &Fs{
+		name: "o2test",
+		opt: Options{
+			ValidationKey: "24553931775f412a57804d272b305848",
+			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
+			PLC:           "persistent-login-cookie",
+			DeviceID:      "web-test-device",
+			APIURL:        server.URL,
+			UploadURL:     server.URL,
+			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
+		},
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.dirCache = dircache.New("", "1", f)
+
+	src := object.NewStaticObjectInfo("upload.txt", time.Now(), int64(len(payload)), true, nil, f)
+	if _, err := f.upload(ctx, strings.NewReader(payload), src); err != nil {
+		t.Fatal(err)
+	}
+	if uploadRequests != 1 {
+		t.Fatalf("upload requests = %d, want 1", uploadRequests)
+	}
+	if renewalRequests != 0 {
+		t.Fatalf("renewal requests = %d, want 0", renewalRequests)
 	}
 }
 
