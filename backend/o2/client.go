@@ -51,9 +51,23 @@ func (f *Fs) addHeaders(req *http.Request) {
 }
 
 func (f *Fs) addCommonHeaders(req *http.Request) {
+	addBrowserHeaders(req)
 	req.Header.Set("X-deviceid", f.opt.DeviceID)
 	req.Header.Set("Referer", f.opt.APIURL+"/")
 	req.Header.Set("Origin", f.opt.APIURL)
+}
+
+func addBrowserHeaders(req *http.Request) {
+	for key, value := range browserHeaders {
+		req.Header.Set(key, value)
+	}
+}
+
+func addFetchHeaders(req *http.Request, site string) {
+	req.Header.Set("Priority", "u=1, i")
+	req.Header.Set("Sec-Fetch-Dest", "empty")
+	req.Header.Set("Sec-Fetch-Mode", "cors")
+	req.Header.Set("Sec-Fetch-Site", site)
 }
 
 func (f *Fs) addSessionCookies(req *http.Request) {
@@ -71,6 +85,15 @@ func (f *Fs) addSessionCookies(req *http.Request) {
 func (f *Fs) addUploadCookie(req *http.Request) {
 	if f.opt.JSessionID != "" {
 		req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
+	}
+}
+
+func (f *Fs) addSessionRenewalCookies(req *http.Request) {
+	if f.opt.ValidationKey != "" {
+		req.AddCookie(&http.Cookie{Name: "validationKey", Value: f.opt.ValidationKey})
+	}
+	if f.opt.PLC != "" {
+		req.AddCookie(&http.Cookie{Name: "PLC", Value: f.opt.PLC})
 	}
 }
 
@@ -196,7 +219,92 @@ func (f *Fs) newAPIRequest(ctx context.Context, method, rawURL string, body requ
 		req.Header.Set("Content-Type", contentType)
 	}
 	req.Header.Set("Accept", "*/*")
+	addFetchHeaders(req, "same-origin")
 	return req, nil
+}
+
+func (f *Fs) refreshUploadSessionBeforeUpload(ctx context.Context) error {
+	if !f.opt.RefreshUploadSession {
+		return nil
+	}
+
+	f.uploadSessionMu.Lock()
+	defer f.uploadSessionMu.Unlock()
+
+	if f.uploadSessionChecked {
+		return nil
+	}
+	f.uploadSessionChecked = true
+
+	if f.opt.ValidationKey == "" || f.opt.PLC == "" {
+		return nil
+	}
+
+	oldNode := sessionNode(f.opt.JSessionID)
+	if err := f.renewSessionFromPLC(ctx); err != nil {
+		return err
+	}
+	fs.Debugf(f, "O2 upload session refresh complete oldNode=%q newNode=%q", oldNode, sessionNode(f.opt.JSessionID))
+	return nil
+}
+
+func (f *Fs) renewSessionFromPLC(ctx context.Context) error {
+	u, err := f.addValidationKey(f.opt.APIURL + "/sapi/media/folder/root?action=get")
+	if err != nil {
+		return err
+	}
+
+	var resp *http.Response
+	err = f.pacer.Call(func() (bool, error) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+		if err != nil {
+			return false, err
+		}
+		f.addCommonHeaders(req)
+		f.addSessionRenewalCookies(req)
+		req.Header.Set("Accept", "*/*")
+		addFetchHeaders(req, "same-origin")
+
+		fs.Debugf(f, "Refreshing O2 session before upload")
+		resp, err = f.client.Do(req)
+		retry, err := shouldRetry(ctx, resp, err)
+		if retry {
+			closeResponse(resp)
+			resp = nil
+		}
+		return retry, err
+	})
+	if err != nil {
+		closeResponse(resp)
+		return err
+	}
+	defer closeResponse(resp)
+
+	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+
+	setCookies := resp.Cookies()
+	err = parseAPIError(resp)
+	if !f.shouldRenewSession(err) {
+		return err
+	}
+	if err := f.applySessionRenewal(err, setCookies); err != nil {
+		return err
+	}
+	if node := sessionNode(f.opt.JSessionID); node != "" {
+		fs.Debugf(f, "O2 session refreshed for upload node=%s", node)
+	}
+	_, err = f.readRootFolderID(ctx)
+	return err
+}
+
+func sessionNode(sessionID string) string {
+	if i := strings.LastIndex(sessionID, "."); i >= 0 && i+1 < len(sessionID) {
+		return sessionID[i+1:]
+	}
+	return ""
 }
 
 func decodeAPIResponse(resp *http.Response, out any) error {
