@@ -1,0 +1,21 @@
+backend: o2
+name: O2 Cloud
+tier: Tier 3
+maintainers: Community
+features_score: 4
+integration_tests: Not supported
+data_integrity: None
+performance: Medium
+adoption: Some use
+docs: Full
+security: Medium
+virtual: false
+remote: 'TestO2:'
+features:
+- About
+- CanHaveEmptyDirectories
+- Move
+- Purge
+- ReadMimeType
+hashes: []
+precision: 1000000
