@@ -115,7 +115,7 @@ func (o *Object) MimeType(ctx context.Context) string {
 	return fs.MimeTypeFromName(o.remote)
 }
 
-func (f *Fs) newObjectFromMedia(remote string, item api.Media, folderID int64) *Object {
+func (f *Fs) newObjectFromMedia(remote string, item api.Media) *Object {
 	mtime := msToTime(item.ModificationDate)
 	if mtime.IsZero() {
 		mtime = msToTime(item.Date)
@@ -124,12 +124,9 @@ func (f *Fs) newObjectFromMedia(remote string, item api.Media, folderID int64) *
 		fs:       f,
 		remote:   remote,
 		id:       item.ID,
-		folderID: folderID,
 		size:     item.Size,
 		modTime:  mtime,
 		mimeType: fs.MimeTypeFromName(remote),
-		etag:     item.ETag,
-		url:      item.URL,
 	}
 }
 
