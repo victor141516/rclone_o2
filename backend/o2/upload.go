@@ -56,7 +56,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, option
 		return nil, errors.New("O2 upload response missing id")
 	}
 
-	return f.newObjectFromUpload(ctx, src, uploadResp, folderID, mimeType), nil
+	return f.newObjectFromUpload(ctx, src, uploadResp, mimeType), nil
 }
 
 func uploadMetadata(name string, folderID, size int64) ([]byte, error) {
@@ -186,22 +186,20 @@ func (f *Fs) doUpload(ctx context.Context, req *http.Request, remote string, fol
 	}
 	defer fs.CheckClose(resp.Body, &err)
 
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+	if !successful(resp) {
 		return uploadResp, parseAPIError(resp)
 	}
 	err = decodeAPIResponse(resp, &uploadResp)
 	return uploadResp, err
 }
 
-func (f *Fs) newObjectFromUpload(ctx context.Context, src fs.ObjectInfo, uploadResp api.UploadResponse, folderID int64, mimeType string) *Object {
+func (f *Fs) newObjectFromUpload(ctx context.Context, src fs.ObjectInfo, uploadResp api.UploadResponse, mimeType string) *Object {
 	return &Object{
 		fs:       f,
 		remote:   src.Remote(),
 		id:       uploadResp.ID,
-		folderID: folderID,
 		size:     src.Size(),
 		modTime:  src.ModTime(ctx),
 		mimeType: mimeType,
-		etag:     uploadResp.ETag,
 	}
 }
