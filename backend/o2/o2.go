@@ -57,6 +57,11 @@ func init() {
 			Default:  defaultUploadURL,
 			Advanced: true,
 		}, {
+			Name:     "refresh_upload_session",
+			Help:     "Refresh the O2 session before the first upload.\n\nThis uses the persistent login cookie to ask O2 for a new session, which may assign a different backend node. Enable this temporarily if uploads are slow and you want to retry with another node.",
+			Default:  false,
+			Advanced: true,
+		}, {
 			Name:     config.ConfigEncoding,
 			Help:     config.ConfigEncodingHelp,
 			Advanced: true,
@@ -67,15 +72,16 @@ func init() {
 
 // Options defines the configuration for this backend.
 type Options struct {
-	PhoneNumber   string               `config:"phone_number"`
-	ValidationKey string               `config:"validation_key"`
-	JSessionID    string               `config:"jsessionid"`
-	PLC           string               `config:"plc"`
-	DeviceID      string               `config:"device_id"`
-	RootFolderID  string               `config:"root_folder_id"`
-	APIURL        string               `config:"api_url"`
-	UploadURL     string               `config:"upload_url"`
-	Enc           encoder.MultiEncoder `config:"encoding"`
+	PhoneNumber          string               `config:"phone_number"`
+	ValidationKey        string               `config:"validation_key"`
+	JSessionID           string               `config:"jsessionid"`
+	PLC                  string               `config:"plc"`
+	DeviceID             string               `config:"device_id"`
+	RootFolderID         string               `config:"root_folder_id"`
+	APIURL               string               `config:"api_url"`
+	UploadURL            string               `config:"upload_url"`
+	RefreshUploadSession bool                 `config:"refresh_upload_session"`
+	Enc                  encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents an O2 Cloud remote.
@@ -90,6 +96,9 @@ type Fs struct {
 	dirCache *dircache.DirCache
 	rootID   string
 	authMu   sync.Mutex
+
+	uploadSessionMu      sync.Mutex
+	uploadSessionChecked bool
 }
 
 // Object describes an O2 Cloud object.
