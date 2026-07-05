@@ -71,29 +71,29 @@ func addFetchHeaders(req *http.Request, site string) {
 }
 
 func (f *Fs) addSessionCookies(req *http.Request) {
-	if f.opt.ValidationKey != "" {
-		req.AddCookie(&http.Cookie{Name: "validationKey", Value: f.opt.ValidationKey})
-	}
-	if f.opt.JSessionID != "" {
-		req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
-	}
-	if f.opt.PLC != "" {
-		req.AddCookie(&http.Cookie{Name: "PLC", Value: f.opt.PLC})
-	}
+	addCookies(req,
+		"validationKey", f.opt.ValidationKey,
+		"JSESSIONID", f.opt.JSessionID,
+		"PLC", f.opt.PLC,
+	)
 }
 
 func (f *Fs) addUploadCookie(req *http.Request) {
-	if f.opt.JSessionID != "" {
-		req.AddCookie(&http.Cookie{Name: "JSESSIONID", Value: f.opt.JSessionID})
-	}
+	addCookies(req, "JSESSIONID", f.opt.JSessionID)
 }
 
 func (f *Fs) addSessionRenewalCookies(req *http.Request) {
-	if f.opt.ValidationKey != "" {
-		req.AddCookie(&http.Cookie{Name: "validationKey", Value: f.opt.ValidationKey})
-	}
-	if f.opt.PLC != "" {
-		req.AddCookie(&http.Cookie{Name: "PLC", Value: f.opt.PLC})
+	addCookies(req,
+		"validationKey", f.opt.ValidationKey,
+		"PLC", f.opt.PLC,
+	)
+}
+
+func addCookies(req *http.Request, pairs ...string) {
+	for i := 0; i+1 < len(pairs); i += 2 {
+		if pairs[i+1] != "" {
+			req.AddCookie(&http.Cookie{Name: pairs[i], Value: pairs[i+1]})
+		}
 	}
 }
 
@@ -161,7 +161,7 @@ func (f *Fs) doRequest(ctx context.Context, method, rawURL string, body requestB
 			return err
 		}
 
-		if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		if !successful(resp) {
 			setCookies := resp.Cookies()
 			err := parseAPIError(resp)
 			closeResponse(resp)
@@ -280,7 +280,7 @@ func (f *Fs) renewSessionFromPLC(ctx context.Context) error {
 	}
 	defer closeResponse(resp)
 
-	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+	if successful(resp) {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		return nil
 	}
@@ -397,4 +397,8 @@ func closeResponse(resp *http.Response) {
 	if resp != nil && resp.Body != nil {
 		_ = resp.Body.Close()
 	}
+}
+
+func successful(resp *http.Response) bool {
+	return resp.StatusCode >= 200 && resp.StatusCode <= 299
 }

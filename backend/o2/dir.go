@@ -67,7 +67,7 @@ func (f *Fs) List(ctx context.Context, dir string) (fs.DirEntries, error) {
 	}
 	for _, item := range media {
 		remote := path.Join(dir, f.opt.Enc.ToStandardName(item.Name))
-		entries = append(entries, f.newObjectFromMedia(remote, item, folderID))
+		entries = append(entries, f.newObjectFromMedia(remote, item))
 	}
 	return entries, nil
 }
@@ -93,7 +93,7 @@ func (f *Fs) NewObject(ctx context.Context, remote string) (fs.Object, error) {
 	}
 	for _, item := range media {
 		if f.opt.Enc.ToStandardName(item.Name) == leaf {
-			return f.newObjectFromMedia(f.objectRemote(remote, dirID, item.Name), item, folderID), nil
+			return f.newObjectFromMedia(f.objectRemote(remote, dirID, item.Name), item), nil
 		}
 	}
 	return nil, fs.ErrorObjectNotFound
@@ -119,7 +119,7 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 
 	fs.Debugf(f, "Moved O2 object id=%s from=%q to=%q folderID=%d", srcObj.id, srcObj.remote, remote, folderID)
 	srcObj.fs.dirCache.FlushDir(parentDir(srcObj.remote))
-	return f.newObjectFromMedia(remote, media, folderID), nil
+	return f.newObjectFromMedia(remote, media), nil
 }
 
 // Put uploads an object.

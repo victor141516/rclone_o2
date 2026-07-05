@@ -25,7 +25,6 @@ import (
 const (
 	defaultAPIURL    = "https://cloud.o2online.es"
 	defaultUploadURL = "https://upload.cloud.o2online.es"
-	rootID           = "0"
 
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
@@ -94,7 +93,6 @@ type Fs struct {
 	client   *http.Client
 	pacer    *fs.Pacer
 	dirCache *dircache.DirCache
-	rootID   string
 	authMu   sync.Mutex
 
 	uploadSessionMu      sync.Mutex
@@ -106,12 +104,9 @@ type Object struct {
 	fs       *Fs
 	remote   string
 	id       string
-	folderID int64
 	size     int64
 	modTime  time.Time
 	mimeType string
-	etag     string
-	url      string
 }
 
 // NewFs constructs an Fs from the path.
@@ -135,7 +130,6 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 	if err != nil {
 		return nil, err
 	}
-	f.rootID = rootFolderID
 	f.dirCache = dircache.New(f.root, rootFolderID, f)
 
 	if err := f.resolveRoot(ctx, rootFolderID); err != nil {
@@ -235,9 +229,15 @@ func (f *Fs) resolveRoot(ctx context.Context, rootFolderID string) error {
 	}
 
 	newRoot, remote := dircache.SplitPath(f.root)
-	tempF := *f
-	tempF.root = newRoot
-	tempF.dirCache = dircache.New(newRoot, rootFolderID, &tempF)
+	tempF := &Fs{
+		name:   f.name,
+		root:   newRoot,
+		opt:    f.opt,
+		m:      f.m,
+		client: f.client,
+		pacer:  f.pacer,
+	}
+	tempF.dirCache = dircache.New(newRoot, rootFolderID, tempF)
 
 	if err := tempF.dirCache.FindRoot(ctx, false); err != nil {
 		return nil

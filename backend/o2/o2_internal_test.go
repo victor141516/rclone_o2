@@ -513,7 +513,6 @@ func TestVFSReadAtUsesRangeOptions(t *testing.T) {
 		},
 		client: server.Client(),
 		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
-		rootID: "1",
 	}
 	f.features = (&fs.Features{
 		CanHaveEmptyDirectories: true,
@@ -679,8 +678,8 @@ func TestUploadRefreshesSessionWhenConfiguredAndSendsKnownLengthMultipartBody(t 
 		t.Fatal(err)
 	}
 	gotObj := obj.(*Object)
-	if gotObj.id != "123" || gotObj.size != int64(len(payload)) || gotObj.etag != "etag-1" {
-		t.Fatalf("uploaded object = id %q size %d etag %q", gotObj.id, gotObj.size, gotObj.etag)
+	if gotObj.id != "123" || gotObj.size != int64(len(payload)) {
+		t.Fatalf("uploaded object = id %q size %d", gotObj.id, gotObj.size)
 	}
 	if uploadRequests != 1 {
 		t.Fatalf("upload requests = %d, want 1", uploadRequests)
