@@ -112,7 +112,15 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 		return nil, err
 	}
 
-	media, err := f.saveMediaMetadata(ctx, srcObj.id, leaf, folderID)
+	mediaType := srcObj.mediaType
+	if mediaType == "" {
+		media, err := f.getMedia(ctx, srcObj.id)
+		if err != nil {
+			return nil, err
+		}
+		mediaType = media.MediaType
+	}
+	media, err := f.saveMediaMetadata(ctx, srcObj.id, mediaType, leaf, folderID)
 	if err != nil {
 		return nil, err
 	}
@@ -120,6 +128,37 @@ func (f *Fs) Move(ctx context.Context, src fs.Object, remote string) (fs.Object,
 	fs.Debugf(f, "Moved O2 object id=%s from=%q to=%q folderID=%d", srcObj.id, srcObj.remote, remote, folderID)
 	srcObj.fs.dirCache.FlushDir(parentDir(srcObj.remote))
 	return f.newObjectFromMedia(remote, media), nil
+}
+
+// DirMove moves a directory server-side.
+func (f *Fs) DirMove(ctx context.Context, src fs.Fs, srcRemote, dstRemote string) error {
+	srcFs, ok := src.(*Fs)
+	if !ok {
+		fs.Debugf(src, "Can't move directory - not same O2 remote")
+		return fs.ErrorCantDirMove
+	}
+
+	srcID, _, _, dstDirectoryID, dstLeaf, err := f.dirCache.DirMove(ctx, srcFs.dirCache, srcFs.root, srcRemote, f.root, dstRemote)
+	if err != nil {
+		return err
+	}
+
+	sourceID, err := parseFolderID(srcID)
+	if err != nil {
+		return err
+	}
+	parentID, err := parseFolderID(dstDirectoryID)
+	if err != nil {
+		return err
+	}
+
+	if err := f.saveFolderMetadata(ctx, sourceID, dstLeaf, parentID); err != nil {
+		return err
+	}
+
+	fs.Debugf(f, "Moved O2 directory id=%d from=%q to=%q parentID=%d", sourceID, srcRemote, dstRemote, parentID)
+	srcFs.dirCache.FlushDir(srcRemote)
+	return nil
 }
 
 // Put uploads an object.

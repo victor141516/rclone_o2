@@ -549,6 +549,164 @@ func TestVFSReadAtUsesRangeOptions(t *testing.T) {
 	}
 }
 
+func TestMoveUsesMediaTypeSpecificSaveMetadata(t *testing.T) {
+	ctx := context.Background()
+	var saveRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/sapi/media/folder" && r.URL.Query().Get("action") == "list":
+			if got := r.URL.Query().Get("parentid"); got != "1" {
+				t.Fatalf("folder list parentid=%q, want 1", got)
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "dest", ID: 20, ParentID: 1}}}})
+
+		case r.URL.Path == "/sapi/upload/video" && r.URL.Query().Get("action") == "save-metadata":
+			saveRequests++
+			if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/x-www-form-urlencoded") {
+				t.Fatalf("Content-Type = %q, want form-urlencoded", got)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				Data struct {
+					ID       int64  `json:"id"`
+					Name     string `json:"name"`
+					FolderID int64  `json:"folderid"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(r.Form.Get("data")), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Data.ID != 123 || payload.Data.Name != "video.mkv" || payload.Data.FolderID != 20 {
+				t.Fatalf("media metadata payload = %+v, want id=123 name=video.mkv folderid=20", payload.Data)
+			}
+			_, _ = w.Write([]byte(`{"success":"true","id":"123"}`))
+
+		case r.URL.Path == "/sapi/media" && r.URL.Query().Get("action") == "get":
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Media: []api.Media{{
+				ID:        "123",
+				Name:      "video.mkv",
+				MediaType: "video",
+				Folder:    20,
+				Size:      10,
+			}}}})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name: "o2test",
+		root: "",
+		opt: Options{
+			ValidationKey: "24553931775f412a57804d272b305848",
+			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
+			DeviceID:      "web-test-device",
+			APIURL:        server.URL,
+			UploadURL:     server.URL,
+			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
+		},
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.dirCache = dircache.New("", "1", f)
+	src := &Object{
+		fs:        f,
+		remote:    "src/video.mkv",
+		id:        "123",
+		size:      10,
+		mediaType: "video",
+	}
+
+	obj, err := f.Move(ctx, src, "dest/video.mkv")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if obj.(*Object).mediaType != "video" {
+		t.Fatalf("moved object mediaType = %q, want video", obj.(*Object).mediaType)
+	}
+	if saveRequests != 1 {
+		t.Fatalf("save requests = %d, want 1", saveRequests)
+	}
+}
+
+func TestDirMoveUsesFolderSaveMetadata(t *testing.T) {
+	ctx := context.Background()
+	var saveRequests int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/sapi/media/folder" && r.URL.Query().Get("action") == "list":
+			switch r.URL.Query().Get("parentid") {
+			case "1":
+				_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{
+					{Name: "source", ID: 10, ParentID: 1},
+					{Name: "dest", ID: 20, ParentID: 1},
+				}}})
+			case "20":
+				_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{}}})
+			default:
+				t.Fatalf("unexpected folder list parentid=%q", r.URL.Query().Get("parentid"))
+			}
+
+		case r.URL.Path == "/sapi/media/folder" && r.URL.Query().Get("action") == "save":
+			saveRequests++
+			if got := r.Header.Get("Content-Type"); !strings.HasPrefix(got, "application/x-www-form-urlencoded") {
+				t.Fatalf("Content-Type = %q, want form-urlencoded", got)
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			var payload struct {
+				Data struct {
+					ID       int64  `json:"id"`
+					Name     string `json:"name"`
+					ParentID int64  `json:"parentid"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(r.Form.Get("data")), &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Data.ID != 10 || payload.Data.Name != "moved" || payload.Data.ParentID != 20 {
+				t.Fatalf("folder metadata payload = %+v, want id=10 name=moved parentid=20", payload.Data)
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Success: "true", Data: api.Data{Folder: &api.Folder{Name: "moved", ID: 10, ParentID: 20}}})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name: "o2test",
+		root: "",
+		opt: Options{
+			ValidationKey: "24553931775f412a57804d272b305848",
+			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
+			DeviceID:      "web-test-device",
+			APIURL:        server.URL,
+			UploadURL:     server.URL,
+			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
+		},
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.dirCache = dircache.New("", "1", f)
+
+	if err := f.DirMove(ctx, f, "source", "dest/moved"); err != nil {
+		t.Fatal(err)
+	}
+	if saveRequests != 1 {
+		t.Fatalf("save requests = %d, want 1", saveRequests)
+	}
+	if _, ok := f.dirCache.Get("source"); ok {
+		t.Fatal("source directory should be flushed from dir cache after move")
+	}
+}
+
 func TestUploadRefreshesSessionWhenConfiguredAndSendsKnownLengthMultipartBody(t *testing.T) {
 	const payload = "payload"
 
