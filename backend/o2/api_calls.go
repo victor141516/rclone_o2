@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/rclone/rclone/backend/o2/api"
@@ -90,15 +91,34 @@ func (f *Fs) createFolder(ctx context.Context, parentID int64, leaf string) (api
 	return folder, nil
 }
 
-func (f *Fs) saveMediaMetadata(ctx context.Context, id, leaf string, folderID int64) (api.Media, error) {
+func (f *Fs) saveFolderMetadata(ctx context.Context, id int64, leaf string, parentID int64) error {
+	payload := map[string]any{"data": map[string]any{
+		"id":       id,
+		"name":     f.opt.Enc.FromStandardName(leaf),
+		"parentid": parentID,
+	}}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	form := url.Values{}
+	form.Set("data", string(data))
+	fs.Debugf(f, "Saving O2 folder metadata id=%d name=%q parentID=%d", id, leaf, parentID)
+	var env api.Envelope
+	return f.doForm(ctx, http.MethodPost, f.opt.APIURL+"/sapi/media/folder?action=save", form, &env)
+}
+
+func (f *Fs) saveMediaMetadata(ctx context.Context, id, mediaType, leaf string, folderID int64) (api.Media, error) {
 	numericID, err := strconv.ParseInt(id, 10, 64)
 	if err != nil {
 		return api.Media{}, err
 	}
 
+	apiLeaf := f.opt.Enc.FromStandardName(leaf)
 	payload := map[string]any{"data": map[string]any{
 		"id":       numericID,
-		"name":     f.opt.Enc.FromStandardName(leaf),
+		"name":     apiLeaf,
 		"folderid": folderID,
 	}}
 	data, err := json.Marshal(payload)
@@ -108,18 +128,27 @@ func (f *Fs) saveMediaMetadata(ctx context.Context, id, leaf string, folderID in
 
 	form := url.Values{}
 	form.Set("data", string(data))
-	fs.Debugf(f, "Saving O2 media metadata id=%s name=%q folderID=%d", id, leaf, folderID)
-	if err := f.doForm(ctx, http.MethodPost, f.opt.APIURL+"/sapi/upload/file?action=save-metadata", form, nil); err != nil {
+	uploadType := mediaMetadataUploadType(mediaType)
+	fs.Debugf(f, "Saving O2 media metadata id=%s type=%q name=%q folderID=%d", id, uploadType, leaf, folderID)
+	var env apiErrorEnvelope
+	if err := f.doForm(ctx, http.MethodPost, f.opt.APIURL+"/sapi/upload/"+uploadType+"?action=save-metadata", form, &env); err != nil {
 		return api.Media{}, err
 	}
 
-	media, err := f.waitMedia(ctx, id)
+	media, err := f.waitMediaInFolder(ctx, id, apiLeaf, folderID)
 	if err != nil {
 		return api.Media{}, err
 	}
-	media.Name = f.opt.Enc.FromStandardName(leaf)
-	media.Folder = folderID
 	return media, nil
+}
+
+func mediaMetadataUploadType(mediaType string) string {
+	switch strings.ToLower(mediaType) {
+	case "audio", "file", "picture", "track", "video":
+		return strings.ToLower(mediaType)
+	default:
+		return "file"
+	}
 }
 
 func (f *Fs) getMedia(ctx context.Context, id string) (api.Media, error) {
@@ -172,6 +201,30 @@ func (f *Fs) waitMedia(ctx context.Context, id string) (api.Media, error) {
 		}
 
 		fs.Debugf(f, "O2 media id=%s not visible yet after upload; waiting", id)
+		if err := sleepWithContext(ctx, time.Duration(i+1)*time.Second); err != nil {
+			return api.Media{}, err
+		}
+	}
+	return api.Media{}, lastErr
+}
+
+func (f *Fs) waitMediaInFolder(ctx context.Context, id, name string, folderID int64) (api.Media, error) {
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		media, err := f.listMedia(ctx, folderID)
+		if err == nil {
+			for _, item := range media {
+				if item.ID == id && item.Name == name {
+					return item, nil
+				}
+			}
+			lastErr = fmt.Errorf("O2 media id=%s name=%q not visible in folderID=%d yet", id, name, folderID)
+		} else {
+			lastErr = err
+			return api.Media{}, err
+		}
+
+		fs.Debugf(f, "O2 media id=%s metadata not visible yet after move; waiting", id)
 		if err := sleepWithContext(ctx, time.Duration(i+1)*time.Second); err != nil {
 			return api.Media{}, err
 		}

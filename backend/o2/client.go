@@ -31,6 +31,10 @@ type apiError struct {
 	Data       string
 }
 
+type apiErrorEnvelope struct {
+	Error *api.Error `json:"error"`
+}
+
 func (e *apiError) Error() string {
 	if e.Code != "" || e.Message != "" {
 		return fmt.Sprintf("o2 api error: status %d code %q: %s", e.StatusCode, e.Code, e.Message)
@@ -320,6 +324,8 @@ func decodeAPIResponse(resp *http.Response, out any) error {
 func responseError(statusCode int, out any) error {
 	switch e := out.(type) {
 	case *api.Envelope:
+		return envelopeError(statusCode, e.Error)
+	case *apiErrorEnvelope:
 		return envelopeError(statusCode, e.Error)
 	case *api.UploadResponse:
 		return envelopeError(statusCode, e.Error)

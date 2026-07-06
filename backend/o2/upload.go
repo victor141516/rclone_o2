@@ -195,11 +195,12 @@ func (f *Fs) doUpload(ctx context.Context, req *http.Request, remote string, fol
 
 func (f *Fs) newObjectFromUpload(ctx context.Context, src fs.ObjectInfo, uploadResp api.UploadResponse, mimeType string) *Object {
 	return &Object{
-		fs:       f,
-		remote:   src.Remote(),
-		id:       uploadResp.ID,
-		size:     src.Size(),
-		modTime:  src.ModTime(ctx),
-		mimeType: mimeType,
+		fs:        f,
+		remote:    src.Remote(),
+		id:        uploadResp.ID,
+		size:      src.Size(),
+		modTime:   src.ModTime(ctx),
+		mimeType:  mimeType,
+		mediaType: uploadResp.Type,
 	}
 }

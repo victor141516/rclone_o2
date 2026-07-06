@@ -14,6 +14,7 @@ remote: 'TestO2:'
 features:
 - About
 - CanHaveEmptyDirectories
+- DirMove
 - Move
 - Purge
 - ReadMimeType

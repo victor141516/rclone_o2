@@ -121,12 +121,13 @@ func (f *Fs) newObjectFromMedia(remote string, item api.Media) *Object {
 		mtime = msToTime(item.Date)
 	}
 	return &Object{
-		fs:       f,
-		remote:   remote,
-		id:       item.ID,
-		size:     item.Size,
-		modTime:  mtime,
-		mimeType: fs.MimeTypeFromName(remote),
+		fs:        f,
+		remote:    remote,
+		id:        item.ID,
+		size:      item.Size,
+		modTime:   mtime,
+		mimeType:  fs.MimeTypeFromName(remote),
+		mediaType: item.MediaType,
 	}
 }
 
