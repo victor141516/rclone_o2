@@ -101,12 +101,13 @@ type Fs struct {
 
 // Object describes an O2 Cloud object.
 type Object struct {
-	fs       *Fs
-	remote   string
-	id       string
-	size     int64
-	modTime  time.Time
-	mimeType string
+	fs        *Fs
+	remote    string
+	id        string
+	size      int64
+	modTime   time.Time
+	mimeType  string
+	mediaType string
 }
 
 // NewFs constructs an Fs from the path.
@@ -204,6 +205,7 @@ func (f *Fs) fillFeatures(ctx context.Context) {
 		ReadMimeType:            true,
 		Purge:                   f.Purge,
 		Move:                    f.Move,
+		DirMove:                 f.DirMove,
 		About:                   f.About,
 	}).Fill(ctx, f)
 }
@@ -277,6 +279,7 @@ var (
 	_ fs.Info      = (*Fs)(nil)
 	_ fs.Abouter   = (*Fs)(nil)
 	_ fs.Mover     = (*Fs)(nil)
+	_ fs.DirMover  = (*Fs)(nil)
 	_ fs.Purger    = (*Fs)(nil)
 	_ fs.Object    = (*Object)(nil)
 	_ fs.DirEntry  = (*Object)(nil)

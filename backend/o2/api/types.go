@@ -59,7 +59,7 @@ type Media struct {
 	Size             int64  `json:"size"`
 	Name             string `json:"name"`
 	ETag             string `json:"etag"`
-	Folder           int64  `json:"folder"`
+	Folder           int64  `json:"folderid"`
 	Favorite         bool   `json:"favorite"`
 	Shared           bool   `json:"shared"`
 	Origin           Origin `json:"origin"`
