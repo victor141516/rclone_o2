@@ -266,7 +266,7 @@ func (f *Fs) Root() string { return f.root }
 func (f *Fs) String() string { return fmt.Sprintf("O2 Cloud root %q", f.root) }
 
 // Precision returns the modtime precision.
-func (f *Fs) Precision() time.Duration { return time.Millisecond }
+func (f *Fs) Precision() time.Duration { return time.Second }
 
 // Hashes returns supported hashes.
 func (f *Fs) Hashes() hash.Set { return hash.Set(hash.None) }

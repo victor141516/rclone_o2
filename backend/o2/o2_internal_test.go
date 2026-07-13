@@ -109,27 +109,67 @@ func TestAuthFormBodyPreservesBrowserOrder(t *testing.T) {
 	}
 }
 
+func decodeUploadMetadata(t *testing.T, name string, modTime time.Time) map[string]any {
+	t.Helper()
+	got, err := uploadMetadata(name, 42, 123, modTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var payload map[string]map[string]any
+	if err := json.Unmarshal(got, &payload); err != nil {
+		t.Fatal(err)
+	}
+	return payload["data"]
+}
+
 func TestUploadMetadataUsesBrowserShapeForAllTypes(t *testing.T) {
 	for _, name := range []string{"song.m4a", "note.txt", "program.exe", "random.unknownext"} {
-		got, err := uploadMetadata(name, 42, 123)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		var payload map[string]map[string]any
-		if err := json.Unmarshal(got, &payload); err != nil {
-			t.Fatal(err)
-		}
-		data := payload["data"]
+		data := decodeUploadMetadata(t, name, time.Now())
 		if data["name"] != name {
 			t.Fatalf("name = %q, want %q", data["name"], name)
-		}
-		if data["modificationdate"] != "" {
-			t.Fatalf("modificationdate = %q", data["modificationdate"])
 		}
 		if _, ok := data["contenttype"]; ok {
 			t.Fatalf("%s metadata should not include contenttype", name)
 		}
+	}
+}
+
+func TestUploadMetadataFormatsModificationTimeAsUTC(t *testing.T) {
+	tests := []struct {
+		name    string
+		modTime time.Time
+		want    string
+	}{
+		{
+			name:    "known",
+			modTime: time.Date(2025, 1, 13, 12, 0, 0, 0, time.FixedZone("UTC+2", 2*60*60)),
+			want:    "20250113T100000Z",
+		},
+		{name: "unknown", modTime: time.Time{}, want: ""},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := decodeUploadMetadata(t, "file.txt", test.modTime)["modificationdate"]; got != test.want {
+				t.Fatalf("modificationdate = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestO2DoesNotAdvertiseETagAsContentHash(t *testing.T) {
+	if got := (&Fs{}).Hashes(); got != hash.Set(hash.None) {
+		t.Fatalf("Hashes = %v, want none", got)
+	}
+	if _, err := (&Object{}).Hash(context.Background(), hash.MD5); err != hash.ErrUnsupported {
+		t.Fatalf("MD5 error = %v, want %v", err, hash.ErrUnsupported)
+	}
+}
+
+func TestPrecisionMatchesUploadTimestampFormat(t *testing.T) {
+	if got := (&Fs{}).Precision(); got != time.Second {
+		t.Fatalf("Precision = %v, want %v", got, time.Second)
 	}
 }
 
