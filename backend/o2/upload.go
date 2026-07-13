@@ -10,12 +10,15 @@ import (
 	"net/http"
 	"net/textproto"
 	"strings"
+	"time"
 
 	"github.com/rclone/rclone/backend/o2/api"
 	"github.com/rclone/rclone/fs"
 )
 
 var multipartQuoteReplacer = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
+
+const uploadModTimeFormat = "20060102T150405Z"
 
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
 	if err := f.refreshUploadSessionBeforeUpload(ctx); err != nil {
@@ -36,7 +39,7 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, option
 	}
 
 	apiLeaf := f.opt.Enc.FromStandardName(leaf)
-	metadata, err := uploadMetadata(apiLeaf, folderID, src.Size())
+	metadata, err := uploadMetadata(apiLeaf, folderID, src.Size(), src.ModTime(ctx))
 	if err != nil {
 		return nil, err
 	}
@@ -59,12 +62,16 @@ func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, option
 	return f.newObjectFromUpload(ctx, src, uploadResp, mimeType), nil
 }
 
-func uploadMetadata(name string, folderID, size int64) ([]byte, error) {
+func uploadMetadata(name string, folderID, size int64, modTime time.Time) ([]byte, error) {
+	modificationDate := ""
+	if !modTime.IsZero() {
+		modificationDate = modTime.UTC().Format(uploadModTimeFormat)
+	}
 	return json.Marshal(map[string]any{"data": map[string]any{
 		"name":             name,
 		"size":             size,
 		"folderid":         folderID,
-		"modificationdate": "",
+		"modificationdate": modificationDate,
 	}})
 }
 
