@@ -32,7 +32,7 @@ mounting them, listing them in lots of different ways.
 See the home page (https://rclone.org/) for installation, usage,
 documentation, changelog and configuration walkthroughs.`,
 	PersistentPostRun: func(cmd *cobra.Command, args []string) {
-		fs.Debugf("rclone", "Version %q finishing with parameters %q", fs.Version, os.Args)
+		fs.Debugf("rclone", "Version %q finishing with parameters %q", fs.Version, redactedArgs(os.Args))
 		atexit.Run()
 	},
 	ValidArgsFunction: validArgs,

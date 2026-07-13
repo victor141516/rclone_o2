@@ -515,9 +515,17 @@ func backendConfigStep(ctx context.Context, name string, m configmap.Mapper, ri 
 			Logf(nil, "--dump auth is in use - debug output may contain secrets such as passwords and tokens")
 		})
 	}
-	Debugf(name, "config in: state=%q, result=%s", in.State, RedactValue(ci, in.Result))
+	Debugf(name, "config in: state_length=%d, result_set=%t", len(in.State), in.Result != "")
 	defer func() {
-		Debugf(name, "config out: out=%s, err=%v", redactConfigOut(ci, out), err)
+		if out == nil {
+			Debugf(name, "config out: finished=true, err=%v", err)
+			return
+		}
+		optionName := ""
+		if out.Option != nil {
+			optionName = out.Option.Name
+		}
+		Debugf(name, "config out: state_length=%d, option=%q, oauth=%t, error=%q, result_set=%t, err=%v", len(out.State), optionName, out.OAuth != nil, out.Error, out.Result != "", err)
 	}()
 
 	switch {
@@ -561,13 +569,13 @@ func backendConfigStep(ctx context.Context, name string, m configmap.Mapper, ri 
 		}
 		// If override value is set in the choices then use that
 		if result, ok := choices.Get(out.Option.Name); ok {
-			Debugf(nil, "Override value found, choosing value %s for state %q", RedactOptionValue(ci, out.Option, result), out.State)
+			Debugf(nil, "Override value found for option %q, choosing supplied value for state_length=%d", out.Option.Name, len(out.State))
 			return ConfigResult(out.State, result)
 		}
 		// If AutoConfirm is set, choose the default value
 		if ci.AutoConfirm {
 			result := fmt.Sprint(out.Option.Default)
-			Debugf(nil, "Auto confirm is set, choosing default %s for state %q, override by setting config parameter %q", RedactOptionValue(ci, out.Option, result), out.State, out.Option.Name)
+			Debugf(nil, "Auto confirm is set, choosing the default for option %q with state_length=%d", out.Option.Name, len(out.State))
 			return ConfigResult(out.State, result)
 		}
 		// If fs.ConfigEdit is set then make the default value
