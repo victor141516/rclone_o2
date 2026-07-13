@@ -99,7 +99,7 @@ func (o *Object) ModTime(ctx context.Context) time.Time { return o.modTime }
 // Size returns the object size.
 func (o *Object) Size() int64 { return o.size }
 
-// Hash returns an unsupported hash.
+// Hash returns an unsupported hash. O2 ETags are not content checksums.
 func (o *Object) Hash(ctx context.Context, ty hash.Type) (string, error) {
 	return "", hash.ErrUnsupported
 }
