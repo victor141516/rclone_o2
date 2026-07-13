@@ -24,6 +24,10 @@ var retryErrorCodes = []int{
 	http.StatusGatewayTimeout,
 }
 
+var redactedURLParameters = []string{
+	"validationkey", "k", "token", "key", "state", "nonce", "code", "sessionID", "sessionData", "jwt",
+}
+
 type apiError struct {
 	StatusCode int
 	Code       string
@@ -78,19 +82,11 @@ func (f *Fs) addSessionCookies(req *http.Request) {
 	addCookies(req,
 		"validationKey", f.opt.ValidationKey,
 		"JSESSIONID", f.opt.JSessionID,
-		"PLC", f.opt.PLC,
 	)
 }
 
 func (f *Fs) addUploadCookie(req *http.Request) {
 	addCookies(req, "JSESSIONID", f.opt.JSessionID)
-}
-
-func (f *Fs) addSessionRenewalCookies(req *http.Request) {
-	addCookies(req,
-		"validationKey", f.opt.ValidationKey,
-		"PLC", f.opt.PLC,
-	)
 }
 
 func addCookies(req *http.Request, pairs ...string) {
@@ -227,90 +223,6 @@ func (f *Fs) newAPIRequest(ctx context.Context, method, rawURL string, body requ
 	return req, nil
 }
 
-func (f *Fs) refreshUploadSessionBeforeUpload(ctx context.Context) error {
-	if !f.opt.RefreshUploadSession {
-		return nil
-	}
-
-	f.uploadSessionMu.Lock()
-	defer f.uploadSessionMu.Unlock()
-
-	if f.uploadSessionChecked {
-		return nil
-	}
-	f.uploadSessionChecked = true
-
-	if f.opt.ValidationKey == "" || f.opt.PLC == "" {
-		return nil
-	}
-
-	oldNode := sessionNode(f.opt.JSessionID)
-	if err := f.renewSessionFromPLC(ctx); err != nil {
-		return err
-	}
-	fs.Debugf(f, "O2 upload session refresh complete oldNode=%q newNode=%q", oldNode, sessionNode(f.opt.JSessionID))
-	return nil
-}
-
-func (f *Fs) renewSessionFromPLC(ctx context.Context) error {
-	u, err := f.addValidationKey(f.opt.APIURL + "/sapi/media/folder/root?action=get")
-	if err != nil {
-		return err
-	}
-
-	var resp *http.Response
-	err = f.pacer.Call(func() (bool, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
-		if err != nil {
-			return false, err
-		}
-		f.addCommonHeaders(req)
-		f.addSessionRenewalCookies(req)
-		req.Header.Set("Accept", "*/*")
-		addFetchHeaders(req, "same-origin")
-
-		fs.Debugf(f, "Refreshing O2 session before upload")
-		resp, err = f.client.Do(req)
-		retry, err := shouldRetry(ctx, resp, err)
-		if retry {
-			closeResponse(resp)
-			resp = nil
-		}
-		return retry, err
-	})
-	if err != nil {
-		closeResponse(resp)
-		return err
-	}
-	defer closeResponse(resp)
-
-	if successful(resp) {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		return nil
-	}
-
-	setCookies := resp.Cookies()
-	err = parseAPIError(resp)
-	if !f.shouldRenewSession(err) {
-		return err
-	}
-	if err := f.applySessionRenewal(err, setCookies); err != nil {
-		return err
-	}
-	if node := sessionNode(f.opt.JSessionID); node != "" {
-		fs.Debugf(f, "O2 session refreshed for upload node=%s", node)
-	}
-	_, err = f.readRootFolderID(ctx)
-	return err
-}
-
-func sessionNode(sessionID string) string {
-	if i := strings.LastIndex(sessionID, "."); i >= 0 && i+1 < len(sessionID) {
-		return sessionID[i+1:]
-	}
-	return ""
-}
-
 func decodeAPIResponse(resp *http.Response, out any) error {
 	if out == nil {
 		return nil
@@ -351,7 +263,7 @@ func parseAPIError(resp *http.Response) error {
 
 func (f *Fs) shouldRenewSession(err error) bool {
 	var apiErr *apiError
-	return errors.As(err, &apiErr) && apiErr.Code == "SEC-1003" && apiErr.Data != "" && f.opt.PLC != ""
+	return errors.As(err, &apiErr) && apiErr.Code == "SEC-1003" && apiErr.Data != ""
 }
 
 func (f *Fs) applySessionRenewal(err error, cookies []*http.Cookie) error {
@@ -368,17 +280,12 @@ func (f *Fs) applySessionRenewal(err error, cookies []*http.Cookie) error {
 		switch cookie.Name {
 		case "JSESSIONID":
 			f.opt.JSessionID = cookie.Value
-		case "PLC":
-			f.opt.PLC = cookie.Value
 		case "validationKey":
 			f.opt.ValidationKey = cookie.Value
 		}
 	}
 	if f.opt.JSessionID == "" {
 		return errors.New("O2 session renewal did not return JSESSIONID")
-	}
-	if f.opt.PLC == "" {
-		return errors.New("O2 session renewal did not return PLC")
 	}
 	f.saveSession()
 	return nil
@@ -390,12 +297,23 @@ func redactedURL(raw string) string {
 		return raw
 	}
 	q := u.Query()
-	for _, key := range []string{"validationkey", "k", "token", "key", "state", "nonce"} {
+	for _, key := range redactedURLParameters {
 		if q.Get(key) != "" {
 			q.Set(key, "REDACTED")
 		}
 	}
 	u.RawQuery = q.Encode()
+	if _, fragmentQuery, found := strings.Cut(u.Fragment, "?"); found {
+		fragmentValues, err := url.ParseQuery(fragmentQuery)
+		if err == nil {
+			for _, key := range redactedURLParameters {
+				if fragmentValues.Get(key) != "" {
+					fragmentValues.Set(key, "REDACTED")
+				}
+			}
+			u.Fragment = strings.SplitN(u.Fragment, "?", 2)[0] + "?" + fragmentValues.Encode()
+		}
+	}
 	return u.String()
 }
 
