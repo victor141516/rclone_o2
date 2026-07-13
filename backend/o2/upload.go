@@ -21,13 +21,6 @@ var multipartQuoteReplacer = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
 const uploadModTimeFormat = "20060102T150405Z"
 
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
-	if err := f.refreshUploadSessionBeforeUpload(ctx); err != nil {
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		fs.Debugf(f, "O2 session refresh before upload failed; continuing with existing session: %v", err)
-	}
-
 	leaf, folderID, err := f.parentFolderID(ctx, src.Remote(), true)
 	if err != nil {
 		return nil, err

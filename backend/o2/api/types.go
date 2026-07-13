@@ -29,8 +29,7 @@ type Data struct {
 	Deleted int64    `json:"softdeleted"`
 	NoLimit bool     `json:"nolimit"`
 
-	AuthorizationURL string `json:"authorizationurl"`
-	ValidationKey    string `json:"validationkey"`
+	ValidationKey string `json:"validationkey"`
 }
 
 // Folder is a folder metadata item.

@@ -414,7 +414,7 @@ func initConfig() {
 	}
 
 	// Write the args for debug purposes
-	fs.Debugf("rclone", "Version %q starting with parameters %q", fs.Version, os.Args)
+	fs.Debugf("rclone", "Version %q starting with parameters %q", fs.Version, redactedArgs(os.Args))
 
 	// Inform user about systemd log support now that we have a logger
 	if fslog.Opt.LogSystemdSupport {
