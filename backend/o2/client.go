@@ -59,7 +59,16 @@ func (f *Fs) addHeaders(req *http.Request) {
 }
 
 func (f *Fs) addCommonHeaders(req *http.Request) {
+	f.addBaseHeaders(req)
+	authorization, err := f.oauthAuthorization()
+	if err == nil {
+		req.Header.Set("Authorization", authorization)
+	}
+}
+
+func (f *Fs) addBaseHeaders(req *http.Request) {
 	addBrowserHeaders(req)
+	req.Header.Set("User-Agent", apiUserAgent)
 	req.Header.Set("X-deviceid", f.opt.DeviceID)
 	req.Header.Set("Referer", f.opt.APIURL+"/")
 	req.Header.Set("Origin", f.opt.APIURL)
@@ -79,13 +88,14 @@ func addFetchHeaders(req *http.Request, site string) {
 }
 
 func (f *Fs) addSessionCookies(req *http.Request) {
-	addCookies(req,
-		"validationKey", f.opt.ValidationKey,
-		"JSESSIONID", f.opt.JSessionID,
-	)
+	f.authMu.Lock()
+	defer f.authMu.Unlock()
+	addCookies(req, "JSESSIONID", f.opt.JSessionID)
 }
 
 func (f *Fs) addUploadCookie(req *http.Request) {
+	f.authMu.Lock()
+	defer f.authMu.Unlock()
 	addCookies(req, "JSESSIONID", f.opt.JSessionID)
 }
 
@@ -98,6 +108,8 @@ func addCookies(req *http.Request, pairs ...string) {
 }
 
 func (f *Fs) addValidationKey(rawURL string) (string, error) {
+	f.authMu.Lock()
+	defer f.authMu.Unlock()
 	u, err := url.Parse(rawURL)
 	if err != nil {
 		return "", err
@@ -162,18 +174,29 @@ func (f *Fs) doRequest(ctx context.Context, method, rawURL string, body requestB
 		}
 
 		if !successful(resp) {
-			setCookies := resp.Cookies()
 			err := parseAPIError(resp)
 			closeResponse(resp)
-			if try == 0 && f.shouldRenewSession(err) {
-				if err := f.applySessionRenewal(err, setCookies); err != nil {
-					return err
+			if try == 0 {
+				if isAPIStatus(err, http.StatusUnauthorized) && f.hasOAuthCredentials() {
+					if err := f.reloginOAuth(ctx); err != nil {
+						if isAPIStatus(err, http.StatusUnauthorized) {
+							return fmt.Errorf("O2 OAuth refresh token was rejected; run \"rclone config reconnect %s:\" to authenticate by SMS again", f.name)
+						}
+						return fmt.Errorf("failed to renew O2 OAuth session: %w", err)
+					}
+					continue
 				}
-				continue
+			}
+			if isAPIStatus(err, http.StatusUnauthorized) {
+				return fmt.Errorf("O2 OAuth session could not be renewed; run \"rclone config reconnect %s:\" to authenticate by SMS again", f.name)
 			}
 			return err
 		}
 
+		if err := f.captureOAuthAuthorization(resp.Header.Get("Authorization")); err != nil {
+			closeResponse(resp)
+			return err
+		}
 		defer fs.CheckClose(resp.Body, &err)
 		return decodeAPIResponse(resp, out)
 	}
@@ -261,34 +284,9 @@ func parseAPIError(resp *http.Response) error {
 	return &apiError{StatusCode: resp.StatusCode}
 }
 
-func (f *Fs) shouldRenewSession(err error) bool {
+func isAPIStatus(err error, statusCode int) bool {
 	var apiErr *apiError
-	return errors.As(err, &apiErr) && apiErr.Code == "SEC-1003" && apiErr.Data != ""
-}
-
-func (f *Fs) applySessionRenewal(err error, cookies []*http.Cookie) error {
-	var apiErr *apiError
-	if !errors.As(err, &apiErr) {
-		return err
-	}
-
-	f.authMu.Lock()
-	defer f.authMu.Unlock()
-
-	f.opt.ValidationKey = apiErr.Data
-	for _, cookie := range cookies {
-		switch cookie.Name {
-		case "JSESSIONID":
-			f.opt.JSessionID = cookie.Value
-		case "validationKey":
-			f.opt.ValidationKey = cookie.Value
-		}
-	}
-	if f.opt.JSessionID == "" {
-		return errors.New("O2 session renewal did not return JSESSIONID")
-	}
-	f.saveSession()
-	return nil
+	return errors.As(err, &apiErr) && apiErr.StatusCode == statusCode
 }
 
 func redactedURL(raw string) string {

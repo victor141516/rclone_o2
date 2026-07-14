@@ -54,6 +54,7 @@ func TestNormalizeDeviceID(t *testing.T) {
 	}{
 		{in: "", want: ""},
 		{in: "web-test-device", want: "web-test-device"},
+		{in: "fac-test-device", want: "fac-test-device"},
 		{in: "test-device", want: "web-test-device"},
 		{in: " test-device ", want: "web-test-device"},
 	} {
@@ -79,15 +80,24 @@ func TestNormalizePhoneNumber(t *testing.T) {
 	}
 }
 
-func TestOptionsValidateAcceptsPKCESession(t *testing.T) {
+func TestOptionsValidateRequiresAndroidOAuth(t *testing.T) {
 	opt := Options{
-		PhoneNumber:   "34600000000",
-		ValidationKey: "validation-key",
-		JSessionID:    "session-id",
-		DeviceID:      "web-device-id",
+		PhoneNumber:  "34600000000",
+		DeviceID:     "fac-device-id",
+		AccessToken:  "access-token",
+		RefreshToken: "refresh-token",
 	}
+	if err := opt.validate(); err == nil {
+		t.Fatal("Android OAuth credentials without login session were accepted")
+	}
+	opt.ValidationKey = "validation-key"
+	opt.JSessionID = "session-id"
 	if err := opt.validate(); err != nil {
-		t.Fatalf("PKCE session rejected: %v", err)
+		t.Fatalf("Android OAuth session rejected: %v", err)
+	}
+	opt.RefreshToken = ""
+	if err := opt.validate(); err == nil {
+		t.Fatal("legacy web-only session was accepted")
 	}
 }
 
@@ -161,22 +171,37 @@ func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	oauthState := "oauth-state"
+	clientID, clientSecret, err := oauthClientCredentials()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var oauthState string
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/sapi/oauth/pkce/authorize":
-			if got := r.URL.Query().Get("platform"); got != "web" {
-				t.Fatalf("PKCE platform = %q, want web", got)
+		case r.URL.Path == "/authorize":
+			query := r.URL.Query()
+			for name, want := range map[string]string{
+				"response_type":         "code",
+				"client_id":             clientID,
+				"redirect_uri":          oauthRedirectURL,
+				"access_type":           "offline",
+				"scope":                 "openid",
+				"code_challenge_method": "S256",
+				"acr_values":            "2",
+			} {
+				if got := query.Get(name); got != want {
+					t.Fatalf("authorize %s = %q, want %q", name, got, want)
+				}
 			}
-			if got := r.URL.Query().Get("deviceid"); !strings.HasPrefix(got, "web-") {
-				t.Fatalf("PKCE deviceid = %q, want web-*", got)
+			if query.Get("code_challenge") == "" || query.Get("nonce") == "" || query.Get("state") == "" {
+				t.Fatal("authorize request is missing PKCE/state/nonce")
 			}
-			http.SetCookie(w, &http.Cookie{Name: "pkce-session", Value: "pkce-cookie", Path: "/"})
+			oauthState = query.Get("state")
 			fragment := url.Values{
 				"action":      {"login"},
-				"client_name": {"O2CLOUD_WEB"},
-				"client_id":   {"web-client"},
+				"client_name": {"O2CLOUD_ANDROID"},
+				"client_id":   {clientID},
 				"state":       {oauthState},
 				"sessionID":   {"session-1"},
 				"sessionData": {"data-1"},
@@ -200,7 +225,7 @@ func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 				t.Fatal(err)
 			}
-			if request.Mobile != "600111222" || request.SessionID != "session-1" || request.SessionData != "data-1" || request.ConsumerID != "O2CLOUD_WEB" {
+			if request.Mobile != "600111222" || request.SessionID != "session-1" || request.SessionData != "data-1" || request.ConsumerID != "O2CLOUD_ANDROID" {
 				t.Fatalf("manage credential request = %#v", request)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{"newSessionID": "session-2", "newSessionData": "data-2"})
@@ -219,28 +244,60 @@ func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 				t.Fatalf("verify credential request = %#v", request)
 			}
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"redirectUri": server.URL + "/sapi/login/oauth?code=auth-code&state=" + url.QueryEscape(oauthState),
+				"redirectUri": oauthRedirectURL + "?code=auth-code&state=" + url.QueryEscape(oauthState),
 			})
 
-		case r.URL.Path == "/sapi/login/oauth":
-			if got := r.URL.Query().Get("state"); got != oauthState {
-				t.Fatalf("callback state = %q, want %q", got, oauthState)
+		case r.URL.Path == "/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
 			}
-			if got, err := r.Cookie("pkce-session"); err != nil || got.Value != "pkce-cookie" {
-				t.Fatalf("PKCE cookie = %v, %v; want pkce-cookie", got, err)
+			for name, want := range map[string]string{
+				"grant_type":    "authorization_code",
+				"code":          "auth-code",
+				"redirect_uri":  oauthRedirectURL,
+				"client_id":     clientID,
+				"client_secret": clientSecret,
+			} {
+				if got := r.Form.Get(name); got != want {
+					t.Fatalf("token %s = %q, want %q", name, got, want)
+				}
 			}
-			http.SetCookie(w, &http.Cookie{Name: "validationKey", Value: "validation-new", Path: "/"})
-			http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "session-new", Path: "/"})
-			http.Redirect(w, r, server.URL+"/", http.StatusFound)
+			if r.Form.Get("code_verifier") == "" {
+				t.Fatal("token request is missing code_verifier")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "access-initial", "refresh_token": "refresh-initial", "expires_in": 3600, "token_type": "Bearer",
+			})
 
-		case r.URL.Path == "/":
-			_, _ = w.Write([]byte("O2 Cloud"))
+		case r.URL.Path == "/sapi/login/oauth" && r.URL.Query().Get("action") == "login":
+			credential, found, err := parseOAuthAuthorization(r.Header.Get("Authorization"))
+			if err != nil || !found || credential.AccessToken != "access-initial" || credential.RefreshToken != "refresh-initial" {
+				t.Fatalf("OAuth login credential = %+v, found=%v, err=%v", credential, found, err)
+			}
+			rotated, err := oauthAuthorization(Options{
+				AccessToken: "access-rotated", RefreshToken: "refresh-rotated", OAuthExpiresIn: "3600", OAuthLastRefreshDate: 12345,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.Header().Set("Authorization", rotated)
+			http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "session-new", Path: "/"})
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"validationkey": "validation-new", "jsessionid": "session-new",
+			}})
 
 		default:
 			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
+	oldAuthorizeURL, oldTokenURL, oldRedirectURL := oauthAuthorizeURL, oauthTokenURL, oauthRedirectURL
+	oauthAuthorizeURL = server.URL + "/authorize"
+	oauthTokenURL = server.URL + "/token"
+	oauthRedirectURL = server.URL + "/ui/html/clientoauth.html"
+	defer func() {
+		oauthAuthorizeURL, oauthTokenURL, oauthRedirectURL = oldAuthorizeURL, oldTokenURL, oldRedirectURL
+	}()
 
 	m := configmap.Simple{"type": "o2", "api_url": server.URL, "upload_url": server.URL}
 	choices := configmap.Simple{
@@ -264,8 +321,20 @@ func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 	if got := revealIfObscured(m["jsessionid"]); got != "session-new" {
 		t.Fatalf("jsessionid = %q, want session-new", got)
 	}
-	if got := m["device_id"]; !strings.HasPrefix(got, "web-") {
-		t.Fatalf("device_id = %q, want web-*", got)
+	if got := revealIfObscured(m["access_token"]); got != "access-rotated" {
+		t.Fatalf("access_token was not rotated")
+	}
+	if got := revealIfObscured(m["refresh_token"]); got != "refresh-rotated" {
+		t.Fatalf("refresh_token was not rotated")
+	}
+	if got := m["oauth_expires_in"]; got != "3600" {
+		t.Fatalf("oauth_expires_in = %q, want 3600", got)
+	}
+	if got := m["oauth_last_refresh_date"]; got != "12345" {
+		t.Fatalf("oauth_last_refresh_date = %q, want 12345", got)
+	}
+	if got := m["device_id"]; !strings.HasPrefix(got, "fac-") {
+		t.Fatalf("device_id = %q, want fac-*", got)
 	}
 }
 
@@ -278,8 +347,8 @@ func TestBackendConfigReportsSMSStartError(t *testing.T) {
 	var server *httptest.Server
 	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
-		case r.URL.Path == "/sapi/oauth/pkce/authorize":
-			fragment := url.Values{"client_name": {"O2CLOUD_WEB"}, "state": {"oauth-state"}, "sessionID": {"session-1"}, "sessionData": {"data-1"}}.Encode()
+		case r.URL.Path == "/authorize":
+			fragment := url.Values{"client_name": {"O2CLOUD_ANDROID"}, "state": {r.URL.Query().Get("state")}, "sessionID": {"session-1"}, "sessionData": {"data-1"}}.Encode()
 			http.Redirect(w, r, server.URL+"/acceso/#/accessUserPassO2?"+fragment, http.StatusFound)
 		case r.URL.Path == "/acceso/":
 			_, _ = w.Write([]byte("Mi O2"))
@@ -296,6 +365,10 @@ func TestBackendConfigReportsSMSStartError(t *testing.T) {
 		}
 	}))
 	defer server.Close()
+	oldAuthorizeURL, oldRedirectURL := oauthAuthorizeURL, oauthRedirectURL
+	oauthAuthorizeURL = server.URL + "/authorize"
+	oauthRedirectURL = server.URL + "/ui/html/clientoauth.html"
+	defer func() { oauthAuthorizeURL, oauthRedirectURL = oldAuthorizeURL, oldRedirectURL }()
 
 	m := configmap.Simple{"type": "o2", "api_url": server.URL, "upload_url": server.URL}
 	choices := configmap.Simple{
@@ -317,7 +390,7 @@ func TestFinishSMSAuthRejectsMismatchedOAuthState(t *testing.T) {
 		switch r.URL.Path {
 		case "/cus/segu/v5/seguCredentialO2s/verifyCredentialMobileO2":
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"redirectUri": "http://" + r.Host + "/sapi/login/oauth?code=auth-code&state=wrong-state",
+				"redirectUri": "http://" + r.Host + "/ui/html/clientoauth.html?code=auth-code&state=wrong-state",
 			})
 		default:
 			callbackRequested = true
@@ -328,9 +401,9 @@ func TestFinishSMSAuthRejectsMismatchedOAuthState(t *testing.T) {
 
 	_, err := finishSMSAuth(context.Background(), authState{
 		APIURL:      server.URL,
-		DeviceID:    "web-device",
+		DeviceID:    "fac-device",
 		LoginURL:    server.URL + "/acceso/",
-		RedirectURL: server.URL + "/sapi/login/oauth",
+		RedirectURL: server.URL + "/ui/html/clientoauth.html",
 		OTPAPIURL:   server.URL,
 		Mobile:      "600000000",
 		OAuthState:  "expected-state",
@@ -345,74 +418,99 @@ func TestFinishSMSAuthRejectsMismatchedOAuthState(t *testing.T) {
 	}
 }
 
-func TestAPIRenewsExpiredSessionAndSavesIt(t *testing.T) {
+func testOAuthOptions(apiURL string) Options {
+	return Options{
+		ValidationKey:        "validation-old",
+		JSessionID:           "session-old",
+		DeviceID:             "fac-test-device",
+		AccessToken:          "access-old",
+		RefreshToken:         "refresh-old",
+		OAuthExpiresIn:       "3600",
+		OAuthLastRefreshDate: time.Now().UnixMilli(),
+		APIURL:               apiURL,
+		UploadURL:            apiURL,
+		Enc:                  encoder.Display | encoder.EncodeInvalidUtf8,
+	}
+}
+
+func TestAPIRenewsAndroidOAuthSessionAndSavesIt(t *testing.T) {
 	ctx := context.Background()
-	var requests int
+	var rootRequests, loginRequests int
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/sapi/media/folder/root" || r.URL.Query().Get("action") != "get" {
-			http.NotFound(w, r)
-			return
-		}
-		requests++
-		switch requests {
-		case 1:
-			if got := r.URL.Query().Get("validationkey"); got != "validation-old" {
-				t.Fatalf("first validationkey = %q, want validation-old", got)
+		switch {
+		case r.URL.Path == "/sapi/login/oauth" && r.URL.Query().Get("action") == "login":
+			loginRequests++
+			if r.Method != http.MethodPost {
+				t.Fatalf("OAuth login method = %s, want POST", r.Method)
 			}
-			if got, err := r.Cookie("validationKey"); err != nil || got.Value != "validation-old" {
-				t.Fatalf("first validationKey cookie = %v, %v; want validation-old", got, err)
+			credential, found, err := parseOAuthAuthorization(r.Header.Get("Authorization"))
+			if err != nil || !found || credential.AccessToken != "access-old" || credential.RefreshToken != "refresh-old" {
+				t.Fatalf("OAuth login credential = %+v, found=%v, err=%v", credential, found, err)
 			}
+			rotated, err := oauthAuthorization(Options{
+				AccessToken: "access-new", RefreshToken: "refresh-new", OAuthExpiresIn: "7200", OAuthLastRefreshDate: 987654321,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.Header().Set("Authorization", rotated)
 			http.SetCookie(w, &http.Cookie{Name: "JSESSIONID", Value: "session-new", Path: "/"})
-			w.WriteHeader(http.StatusUnauthorized)
-			_ = json.NewEncoder(w).Encode(api.Envelope{Error: &api.Error{
-				Code:    "SEC-1003",
-				Message: "expired",
-				Data:    "validation-new",
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"validationkey": "validation-new", "jsessionid": "session-new",
 			}})
-		case 2:
-			if got := r.URL.Query().Get("validationkey"); got != "validation-new" {
-				t.Fatalf("second validationkey = %q, want validation-new", got)
-			}
-			for name, want := range map[string]string{
-				"validationKey": "validation-new",
-				"JSESSIONID":    "session-new",
-			} {
-				got, err := r.Cookie(name)
-				if err != nil || got.Value != want {
-					t.Fatalf("second %s cookie = %v, %v; want %s", name, got, err, want)
+
+		case r.URL.Path == "/sapi/media/folder/root" && r.URL.Query().Get("action") == "get":
+			rootRequests++
+			switch rootRequests {
+			case 1:
+				if got := r.URL.Query().Get("validationkey"); got != "validation-old" {
+					t.Fatalf("first validationkey = %q, want validation-old", got)
 				}
-			}
-			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "/", ID: 42}}}})
-		case 3:
-			if got := r.URL.Query().Get("validationkey"); got != "validation-new" {
-				t.Fatalf("third validationkey = %q, want validation-new", got)
-			}
-			for name, want := range map[string]string{
-				"validationKey": "validation-new",
-				"JSESSIONID":    "session-new",
-			} {
-				got, err := r.Cookie(name)
-				if err != nil || got.Value != want {
-					t.Fatalf("third %s cookie = %v, %v; want %s", name, got, err, want)
+				if _, err := r.Cookie("validationKey"); err == nil {
+					t.Fatal("legacy validationKey cookie was sent")
 				}
+				if got, err := r.Cookie("JSESSIONID"); err != nil || got.Value != "session-old" {
+					t.Fatalf("first JSESSIONID = %v, %v; want session-old", got, err)
+				}
+				credential, found, err := parseOAuthAuthorization(r.Header.Get("Authorization"))
+				if err != nil || !found || credential.AccessToken != "access-old" || credential.RefreshToken != "refresh-old" {
+					t.Fatalf("first OAuth credential = %+v, found=%v, err=%v", credential, found, err)
+				}
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = io.WriteString(w, "<html>expired</html>")
+			case 2, 3:
+				if got := r.URL.Query().Get("validationkey"); got != "validation-new" {
+					t.Fatalf("renewed validationkey = %q, want validation-new", got)
+				}
+				if _, err := r.Cookie("validationKey"); err == nil {
+					t.Fatal("legacy validationKey cookie was sent after renewal")
+				}
+				if got, err := r.Cookie("JSESSIONID"); err != nil || got.Value != "session-new" {
+					t.Fatalf("renewed JSESSIONID = %v, %v; want session-new", got, err)
+				}
+				credential, found, err := parseOAuthAuthorization(r.Header.Get("Authorization"))
+				if err != nil || !found || credential.AccessToken != "access-new" || credential.RefreshToken != "refresh-new" {
+					t.Fatalf("renewed OAuth credential = %+v, found=%v, err=%v", credential, found, err)
+				}
+				id := int64(42)
+				if rootRequests == 3 {
+					id = 43
+				}
+				_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "/", ID: id}}}})
+			default:
+				t.Fatalf("unexpected root request %d", rootRequests)
 			}
-			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: []api.Folder{{Name: "/", ID: 43}}}})
+
 		default:
-			t.Fatalf("unexpected request %d", requests)
+			http.NotFound(w, r)
 		}
 	}))
 	defer server.Close()
 
 	m := configmap.Simple{"phone_number": "34600111222", "api_url": server.URL, "upload_url": server.URL}
 	f := &Fs{
-		name: "o2test",
-		opt: Options{
-			ValidationKey: "validation-old",
-			DeviceID:      "web-test-device",
-			APIURL:        server.URL,
-			UploadURL:     server.URL,
-			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
-		},
+		name:   "o2test",
+		opt:    testOAuthOptions(server.URL),
 		m:      m,
 		client: server.Client(),
 		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
@@ -431,8 +529,14 @@ func TestAPIRenewsExpiredSessionAndSavesIt(t *testing.T) {
 	if got := revealIfObscured(m["jsessionid"]); got != "session-new" {
 		t.Fatalf("saved jsessionid = %q, want session-new", got)
 	}
-	if got := m["device_id"]; got != "web-test-device" {
-		t.Fatalf("saved device_id = %q, want web-test-device", got)
+	if got := revealIfObscured(m["access_token"]); got != "access-new" {
+		t.Fatalf("saved access_token = %q, want access-new", got)
+	}
+	if got := revealIfObscured(m["refresh_token"]); got != "refresh-new" {
+		t.Fatalf("saved refresh_token = %q, want refresh-new", got)
+	}
+	if got := m["device_id"]; got != "fac-test-device" {
+		t.Fatalf("saved device_id = %q, want fac-test-device", got)
 	}
 
 	opt, err := readOptions(m)
@@ -452,6 +556,34 @@ func TestAPIRenewsExpiredSessionAndSavesIt(t *testing.T) {
 	}
 	if id != 43 {
 		t.Fatalf("second Fs root id = %d, want 43", id)
+	}
+	if loginRequests != 1 {
+		t.Fatalf("OAuth login requests = %d, want 1", loginRequests)
+	}
+}
+
+func TestAPIReportsRejectedAndroidRefreshToken(t *testing.T) {
+	ctx := context.Background()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/media/folder/root" && r.URL.Path != "/sapi/login/oauth" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusUnauthorized)
+		_ = json.NewEncoder(w).Encode(api.Envelope{Error: &api.Error{Code: "SEC-1001", Message: "invalid OAuth credentials"}})
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name:   "o2test",
+		opt:    testOAuthOptions(server.URL),
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+
+	_, err := f.readRootFolderID(ctx)
+	if err == nil || !strings.Contains(err.Error(), `rclone config reconnect o2test:`) {
+		t.Fatalf("error = %v, want reconnect instruction", err)
 	}
 }
 
@@ -585,15 +717,8 @@ func TestVFSReadAtUsesRangeOptions(t *testing.T) {
 	defer server.Close()
 
 	f := &Fs{
-		name: "o2test",
-		opt: Options{
-			ValidationKey: "24553931775f412a57804d272b305848",
-			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
-			DeviceID:      "web-test-device",
-			APIURL:        server.URL,
-			UploadURL:     server.URL,
-			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
-		},
+		name:   "o2test",
+		opt:    testOAuthOptions(server.URL),
 		client: server.Client(),
 		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
@@ -806,7 +931,7 @@ func TestUploadSendsKnownLengthMultipartBody(t *testing.T) {
 			t.Fatalf("TransferEncoding = %#v, want no chunked transfer", r.TransferEncoding)
 		}
 		cookies := r.Cookies()
-		if len(cookies) != 1 || cookies[0].Name != "JSESSIONID" || cookies[0].Value != "2D4F6F492842ADB18DEB929ACE9984E8.1i221" {
+		if len(cookies) != 1 || cookies[0].Name != "JSESSIONID" || cookies[0].Value != "session-old" {
 			t.Fatalf("upload cookies = %#v, want JSESSIONID only", cookies)
 		}
 
@@ -858,15 +983,8 @@ func TestUploadSendsKnownLengthMultipartBody(t *testing.T) {
 
 	ctx := context.Background()
 	f := &Fs{
-		name: "o2test",
-		opt: Options{
-			ValidationKey: "24553931775f412a57804d272b305848",
-			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
-			DeviceID:      "web-test-device",
-			APIURL:        server.URL,
-			UploadURL:     server.URL,
-			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
-		},
+		name:   "o2test",
+		opt:    testOAuthOptions(server.URL),
 		client: server.Client(),
 		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}
@@ -890,10 +1008,14 @@ func TestUploadRequestAlwaysUsesAsync(t *testing.T) {
 	ctx := context.Background()
 	f := &Fs{
 		opt: Options{
-			ValidationKey: "validation",
-			DeviceID:      "web-test-device",
-			APIURL:        "https://cloud.o2online.es",
-			UploadURL:     "https://upload.cloud.o2online.es",
+			ValidationKey:  "validation",
+			JSessionID:     "session",
+			DeviceID:       "fac-test-device",
+			AccessToken:    "access",
+			RefreshToken:   "refresh",
+			OAuthExpiresIn: "3600",
+			APIURL:         "https://cloud.o2online.es",
+			UploadURL:      "https://upload.cloud.o2online.es",
 		},
 	}
 
@@ -956,15 +1078,8 @@ func TestUploadDoesNotLowLevelRetryStreamingBody(t *testing.T) {
 
 	ctx := context.Background()
 	f := &Fs{
-		name: "o2test",
-		opt: Options{
-			ValidationKey: "24553931775f412a57804d272b305848",
-			JSessionID:    "2D4F6F492842ADB18DEB929ACE9984E8.1i221",
-			DeviceID:      "web-test-device",
-			APIURL:        server.URL,
-			UploadURL:     server.URL,
-			Enc:           encoder.Display | encoder.EncodeInvalidUtf8,
-		},
+		name:   "o2test",
+		opt:    testOAuthOptions(server.URL),
 		client: server.Client(),
 		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
 	}

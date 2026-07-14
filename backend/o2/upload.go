@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -21,6 +22,9 @@ var multipartQuoteReplacer = strings.NewReplacer("\\", "\\\\", `"`, "\\\"")
 const uploadModTimeFormat = "20060102T150405Z"
 
 func (f *Fs) upload(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) (fs.Object, error) {
+	if err := f.ensureOAuthSession(ctx); err != nil {
+		return nil, fmt.Errorf("failed to prepare O2 OAuth session for upload: %w", err)
+	}
 	leaf, folderID, err := f.parentFolderID(ctx, src.Remote(), true)
 	if err != nil {
 		return nil, err
@@ -188,6 +192,9 @@ func (f *Fs) doUpload(ctx context.Context, req *http.Request, remote string, fol
 
 	if !successful(resp) {
 		return uploadResp, parseAPIError(resp)
+	}
+	if err := f.captureOAuthAuthorization(resp.Header.Get("Authorization")); err != nil {
+		return uploadResp, err
 	}
 	err = decodeAPIResponse(resp, &uploadResp)
 	return uploadResp, err
