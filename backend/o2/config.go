@@ -35,7 +35,7 @@ func revealIfObscured(value string) string {
 
 func normalizeDeviceID(value string) string {
 	value = strings.TrimSpace(value)
-	if value == "" || strings.HasPrefix(value, "web-") {
+	if value == "" || strings.HasPrefix(value, "web-") || strings.HasPrefix(value, "fac-") {
 		return value
 	}
 	return "web-" + value
