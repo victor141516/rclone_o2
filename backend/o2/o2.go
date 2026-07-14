@@ -66,14 +66,18 @@ func init() {
 
 // Options defines the configuration for this backend.
 type Options struct {
-	PhoneNumber   string               `config:"phone_number"`
-	ValidationKey string               `config:"validation_key"`
-	JSessionID    string               `config:"jsessionid"`
-	DeviceID      string               `config:"device_id"`
-	RootFolderID  string               `config:"root_folder_id"`
-	APIURL        string               `config:"api_url"`
-	UploadURL     string               `config:"upload_url"`
-	Enc           encoder.MultiEncoder `config:"encoding"`
+	PhoneNumber          string               `config:"phone_number"`
+	ValidationKey        string               `config:"validation_key"`
+	JSessionID           string               `config:"jsessionid"`
+	DeviceID             string               `config:"device_id"`
+	AccessToken          string               `config:"access_token"`
+	RefreshToken         string               `config:"refresh_token"`
+	OAuthExpiresIn       string               `config:"oauth_expires_in"`
+	OAuthLastRefreshDate int64                `config:"oauth_last_refresh_date"`
+	RootFolderID         string               `config:"root_folder_id"`
+	APIURL               string               `config:"api_url"`
+	UploadURL            string               `config:"upload_url"`
+	Enc                  encoder.MultiEncoder `config:"encoding"`
 }
 
 // Fs represents an O2 Cloud remote.
@@ -152,6 +156,8 @@ func readOptionsUnchecked(m configmap.Mapper) (Options, error) {
 	opt.PhoneNumber = normalizePhoneNumber(opt.PhoneNumber)
 	opt.ValidationKey = revealValidationKey(opt.ValidationKey)
 	opt.JSessionID = revealJSessionID(opt.JSessionID)
+	opt.AccessToken = revealIfObscured(opt.AccessToken)
+	opt.RefreshToken = revealIfObscured(opt.RefreshToken)
 	opt.DeviceID = normalizeDeviceID(opt.DeviceID)
 	opt.APIURL = strings.TrimRight(opt.APIURL, "/")
 	opt.UploadURL = strings.TrimRight(opt.UploadURL, "/")
@@ -162,6 +168,9 @@ func readOptionsUnchecked(m configmap.Mapper) (Options, error) {
 func (opt Options) validate() error {
 	if opt.PhoneNumber == "" {
 		return errors.New("O2 Cloud phone number missing; run \"rclone config reconnect\" to authenticate with SMS")
+	}
+	if opt.AccessToken == "" || opt.RefreshToken == "" {
+		return errors.New("O2 Cloud renewable OAuth credentials missing; run \"rclone config reconnect\" to authenticate with SMS")
 	}
 	if opt.ValidationKey == "" || opt.JSessionID == "" {
 		return errors.New("O2 Cloud session missing; run \"rclone config reconnect\" to authenticate with SMS")

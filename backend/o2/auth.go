@@ -3,6 +3,7 @@ package o2
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -21,10 +22,14 @@ import (
 )
 
 const (
-	configPhoneNumber   = "phone_number"
-	configValidationKey = "validation_key"
-	configJSessionID    = "jsessionid"
-	configDeviceID      = "device_id"
+	configPhoneNumber          = "phone_number"
+	configValidationKey        = "validation_key"
+	configJSessionID           = "jsessionid"
+	configDeviceID             = "device_id"
+	configAccessToken          = "access_token"
+	configRefreshToken         = "refresh_token"
+	configOAuthExpiresIn       = "oauth_expires_in"
+	configOAuthLastRefreshDate = "oauth_last_refresh_date"
 
 	statePhone         = "phone"
 	stateConfirmReauth = "confirm_reauth"
@@ -33,16 +38,17 @@ const (
 )
 
 type authState struct {
-	APIURL      string          `json:"api_url"`
-	DeviceID    string          `json:"device_id"`
-	LoginURL    string          `json:"login_url"`
-	RedirectURL string          `json:"redirect_url"`
-	OTPAPIURL   string          `json:"otp_api_url"`
-	Mobile      string          `json:"mobile"`
-	OAuthState  string          `json:"oauth_state"`
-	SessionID   string          `json:"session_id"`
-	SessionData string          `json:"session_data"`
-	Cookies     []authCookieSet `json:"cookies"`
+	APIURL       string          `json:"api_url"`
+	DeviceID     string          `json:"device_id"`
+	LoginURL     string          `json:"login_url"`
+	RedirectURL  string          `json:"redirect_url"`
+	OTPAPIURL    string          `json:"otp_api_url"`
+	Mobile       string          `json:"mobile"`
+	OAuthState   string          `json:"oauth_state"`
+	CodeVerifier string          `json:"code_verifier"`
+	SessionID    string          `json:"session_id"`
+	SessionData  string          `json:"session_data"`
+	Cookies      []authCookieSet `json:"cookies"`
 }
 
 type t3Environment struct {
@@ -71,17 +77,19 @@ type authCookieSet struct {
 }
 
 type authResult struct {
-	ValidationKey string
-	JSessionID    string
-	DeviceID      string
+	ValidationKey        string
+	JSessionID           string
+	DeviceID             string
+	AccessToken          string
+	RefreshToken         string
+	OAuthExpiresIn       string
+	OAuthLastRefreshDate int64
 }
 
 var browserHeaders = map[string]string{
-	"Accept-Language":    "en-US,en;q=0.9",
-	"Sec-CH-UA":          `"Not;A=Brand";v="8", "Chromium";v="150", "Google Chrome";v="150"`,
-	"Sec-CH-UA-Mobile":   "?0",
-	"Sec-CH-UA-Platform": `"macOS"`,
-	"User-Agent":         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+	"Accept-Language":  "es-ES,es;q=0.9,en;q=0.8",
+	"User-Agent":       "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP4A.250205.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/137.0.7151.115 Mobile Safari/537.36",
+	"X-Requested-With": "es.o2online.cloud",
 }
 
 // Config runs the interactive O2 SMS login flow.
@@ -98,7 +106,7 @@ func Config(ctx context.Context, name string, m configmap.Mapper, in fs.ConfigIn
 			return fs.ConfigInput(statePhone, "config_phone_number", "O2 phone number used to receive the login SMS")
 		}
 		m.Set(configPhoneNumber, opt.PhoneNumber)
-		if opt.ValidationKey != "" && opt.JSessionID != "" && opt.DeviceID != "" {
+		if opt.AccessToken != "" && opt.RefreshToken != "" && opt.DeviceID != "" {
 			return fs.ConfigConfirm(stateConfirmReauth, false, "config_reauth", "O2 Cloud is already authenticated. Re-authenticate with SMS?")
 		}
 		return fs.ConfigGoto(stateStartAuth)
@@ -173,16 +181,42 @@ func popStateArg(state string) (string, string) {
 func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	client := newAuthHTTPClient(ctx)
 
-	pkceURL, err := url.Parse(strings.TrimRight(opt.APIURL, "/") + "/sapi/oauth/pkce/authorize")
+	clientID, _, err := oauthClientCredentials()
 	if err != nil {
 		return authState{}, err
 	}
-	pkceQuery := pkceURL.Query()
-	pkceQuery.Set("platform", "web")
-	pkceQuery.Set("deviceid", opt.DeviceID)
-	pkceURL.RawQuery = pkceQuery.Encode()
+	codeVerifier, err := newRandomBase64URL(48)
+	if err != nil {
+		return authState{}, err
+	}
+	codeChallengeHash := sha256.Sum256([]byte(codeVerifier))
+	codeChallenge := base64.RawURLEncoding.EncodeToString(codeChallengeHash[:])
+	oauthState, err := newRandomBase64URL(32)
+	if err != nil {
+		return authState{}, err
+	}
+	nonce, err := newRandomHex()
+	if err != nil {
+		return authState{}, err
+	}
+	authorizeURL, err := url.Parse(oauthAuthorizeURL)
+	if err != nil {
+		return authState{}, err
+	}
+	authorizeQuery := authorizeURL.Query()
+	authorizeQuery.Set("response_type", "code")
+	authorizeQuery.Set("client_id", clientID)
+	authorizeQuery.Set("redirect_uri", oauthRedirectURL)
+	authorizeQuery.Set("access_type", "offline")
+	authorizeQuery.Set("scope", "openid")
+	authorizeQuery.Set("state", oauthState)
+	authorizeQuery.Set("nonce", nonce)
+	authorizeQuery.Set("code_challenge", codeChallenge)
+	authorizeQuery.Set("code_challenge_method", "S256")
+	authorizeQuery.Set("acr_values", "2")
+	authorizeURL.RawQuery = authorizeQuery.Encode()
 
-	resp, loginURL, err := authRequest(ctx, client, http.MethodGet, pkceURL.String(), navigationHeaders(opt.APIURL, "same-origin"), "")
+	resp, loginURL, err := authRequest(ctx, client, http.MethodGet, authorizeURL.String(), navigationHeaders(opt.APIURL, "cross-site"), "")
 	if err != nil {
 		return authState{}, err
 	}
@@ -198,12 +232,14 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	sessionID := loginParameters.Get("sessionID")
 	sessionData := loginParameters.Get("sessionData")
 	consumerID := loginParameters.Get("client_name")
-	oauthState := loginParameters.Get("state")
-	if sessionID == "" || sessionData == "" || consumerID == "" || oauthState == "" {
+	if sessionID == "" || sessionData == "" || consumerID == "" || loginParameters.Get("state") == "" {
 		return authState{}, errors.New("O2 login did not return the Mi O2 session parameters")
 	}
+	if loginParameters.Get("state") != oauthState {
+		return authState{}, errors.New("O2 login returned an invalid OAuth state")
+	}
 	loginPageURL := stripURLFragment(loginURL)
-	redirectURL := strings.TrimRight(opt.APIURL, "/") + "/sapi/login/oauth"
+	redirectURL := oauthRedirectURL
 
 	environmentURL := resolveURL(loginPageURL, "/coco-envInfo/env.json")
 	resp, _, err = authRequest(ctx, client, http.MethodGet, environmentURL, jsonHeaders(loginPageURL), "")
@@ -252,16 +288,17 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	sessionData = firstNonEmpty(managed.NewSessionData, sessionData)
 
 	return authState{
-		APIURL:      opt.APIURL,
-		DeviceID:    opt.DeviceID,
-		LoginURL:    loginPageURL,
-		RedirectURL: redirectURL,
-		OTPAPIURL:   environment.APIGatewayURL,
-		Mobile:      mobile,
-		OAuthState:  oauthState,
-		SessionID:   sessionID,
-		SessionData: sessionData,
-		Cookies:     exportAuthCookies(client, opt.APIURL, pkceURL.String(), loginPageURL, environment.APIGatewayURL),
+		APIURL:       opt.APIURL,
+		DeviceID:     opt.DeviceID,
+		LoginURL:     loginPageURL,
+		RedirectURL:  redirectURL,
+		OTPAPIURL:    environment.APIGatewayURL,
+		Mobile:       mobile,
+		OAuthState:   oauthState,
+		CodeVerifier: codeVerifier,
+		SessionID:    sessionID,
+		SessionData:  sessionData,
+		Cookies:      exportAuthCookies(client, opt.APIURL, authorizeURL.String(), loginPageURL, environment.APIGatewayURL),
 	}, nil
 }
 
@@ -318,43 +355,35 @@ func finishSMSAuth(ctx context.Context, started authState, code string) (authRes
 		return authResult{}, errors.New("O2 SMS login did not return an authorization code")
 	}
 
-	resp, finalURL, err := authRequest(ctx, client, http.MethodGet, verified.RedirectURI, navigationHeaders(started.LoginURL, "cross-site"), "")
+	result, err := exchangeOAuthCode(ctx, client, authorizationCode, started.CodeVerifier)
 	if err != nil {
 		return authResult{}, err
 	}
-	defer fs.CheckClose(resp.Body, &err)
-	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		return authResult{}, authHTTPError(resp)
-	}
-	if origin(finalURL) != origin(started.APIURL) {
-		return authResult{}, fmt.Errorf("O2 SMS login finished at an unexpected URL: %s", redactedURL(finalURL))
-	}
-
-	result := authResult{
-		ValidationKey: authCookie(client, started.APIURL, "validationKey"),
-		JSessionID:    authCookie(client, started.APIURL, "JSESSIONID"),
-		DeviceID:      started.DeviceID,
-	}
-	if result.ValidationKey == "" || result.JSessionID == "" {
-		return authResult{}, errors.New("O2 login did not return a complete session")
-	}
-	return result, nil
+	return completeOAuthLogin(ctx, client, started.APIURL, started.DeviceID, result)
 }
 
 func saveAuthResult(m configmap.Mapper, result authResult) {
 	m.Set(configValidationKey, obscure.MustObscure(result.ValidationKey))
 	m.Set(configJSessionID, obscure.MustObscure(result.JSessionID))
 	m.Set(configDeviceID, result.DeviceID)
+	m.Set(configAccessToken, obscure.MustObscure(result.AccessToken))
+	m.Set(configRefreshToken, obscure.MustObscure(result.RefreshToken))
+	m.Set(configOAuthExpiresIn, result.OAuthExpiresIn)
+	m.Set(configOAuthLastRefreshDate, fmt.Sprint(result.OAuthLastRefreshDate))
 }
 
-func (f *Fs) saveSession() {
+func (f *Fs) saveSessionUnlocked() {
 	if f.m == nil {
 		return
 	}
 	saveAuthResult(f.m, authResult{
-		ValidationKey: f.opt.ValidationKey,
-		JSessionID:    f.opt.JSessionID,
-		DeviceID:      f.opt.DeviceID,
+		ValidationKey:        f.opt.ValidationKey,
+		JSessionID:           f.opt.JSessionID,
+		DeviceID:             f.opt.DeviceID,
+		AccessToken:          f.opt.AccessToken,
+		RefreshToken:         f.opt.RefreshToken,
+		OAuthExpiresIn:       f.opt.OAuthExpiresIn,
+		OAuthLastRefreshDate: f.opt.OAuthLastRefreshDate,
 	})
 }
 
@@ -412,19 +441,6 @@ func authRequest(ctx context.Context, client *http.Client, method, rawURL string
 	return nil, "", errors.New("too many O2 authentication redirects")
 }
 
-func xhrHeaders(opt Options) map[string]string {
-	headers := cloneHeaders(browserHeaders)
-	headers["Accept"] = "*/*"
-	headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8"
-	headers["Priority"] = "u=1, i"
-	headers["Referer"] = strings.TrimRight(opt.APIURL, "/") + "/"
-	headers["Sec-Fetch-Dest"] = "empty"
-	headers["Sec-Fetch-Mode"] = "cors"
-	headers["Sec-Fetch-Site"] = "same-origin"
-	headers["X-deviceid"] = opt.DeviceID
-	return headers
-}
-
 func navigationHeaders(referer, fetchSite string) map[string]string {
 	headers := cloneHeaders(browserHeaders)
 	headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
@@ -452,24 +468,6 @@ func t3Headers(referer string) map[string]string {
 	headers["Content-Type"] = "application/json"
 	headers["Origin"] = origin(referer)
 	headers["Sec-Fetch-Site"] = "cross-site"
-	return headers
-}
-
-func apiHeaders(apiURL string, result authResult) map[string]string {
-	headers := cloneHeaders(browserHeaders)
-	headers["Accept"] = "*/*"
-	headers["Referer"] = strings.TrimRight(apiURL, "/") + "/"
-	headers["X-deviceid"] = result.DeviceID
-	cookies := []string{}
-	if result.ValidationKey != "" {
-		cookies = append(cookies, "validationKey="+result.ValidationKey)
-	}
-	if result.JSessionID != "" {
-		cookies = append(cookies, "JSESSIONID="+result.JSessionID)
-	}
-	if len(cookies) > 0 {
-		headers["Cookie"] = strings.Join(cookies, "; ")
-	}
 	return headers
 }
 
@@ -516,26 +514,6 @@ func importAuthCookies(client *http.Client, sets []authCookieSet) {
 		if err == nil {
 			client.Jar.SetCookies(u, set.Cookies)
 		}
-	}
-}
-
-func authCookie(client *http.Client, rawURL, name string) string {
-	u, err := url.Parse(strings.TrimRight(rawURL, "/") + "/")
-	if err != nil {
-		return ""
-	}
-	for _, cookie := range client.Jar.Cookies(u) {
-		if cookie.Name == name {
-			return cookie.Value
-		}
-	}
-	return ""
-}
-
-func setAuthCookie(client *http.Client, rawURL, name, value string) {
-	u, err := url.Parse(strings.TrimRight(rawURL, "/") + "/")
-	if err == nil {
-		client.Jar.SetCookies(u, []*http.Cookie{{Name: name, Value: value}})
 	}
 }
 
@@ -650,7 +628,15 @@ func newDeviceID() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return "web-" + id, nil
+	return "fac-" + id, nil
+}
+
+func newRandomBase64URL(size int) (string, error) {
+	b := make([]byte, size)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
 func firstNonEmpty(values ...string) string {
