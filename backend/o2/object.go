@@ -62,21 +62,66 @@ func (o *Object) Open(ctx context.Context, options ...fs.OpenOption) (io.ReadClo
 
 // Update updates an object.
 func (o *Object) Update(ctx context.Context, in io.Reader, src fs.ObjectInfo, options ...fs.OpenOption) error {
-	newObject, err := o.fs.upload(ctx, in, src, options...)
+	leaf, folderID, err := o.fs.parentFolderID(ctx, src.Remote(), true)
 	if err != nil {
 		return err
 	}
-	if err := o.Remove(ctx); err != nil {
-		fs.Debugf(o, "Failed to delete old O2 object id=%s after update: %v", o.id, err)
+
+	// O2/Movistar don't overwrite an existing file when uploading by name. They
+	// keep the old object and auto-rename the newly uploaded object (for example
+	// "hello.txt" -> "hello (1).txt"). Upload the replacement with a temporary
+	// name first, then delete the old object and rename the replacement back to
+	// the requested leaf.
+	tmpRemote := path.Join(parentDir(src.Remote()), fmt.Sprintf("%s.rclone-upload-%d", leaf, time.Now().UnixNano()))
+	tmpSrc := fs.NewOverrideRemote(src, tmpRemote)
+	newObject, err := o.fs.upload(ctx, in, tmpSrc, options...)
+	if err != nil {
+		return err
 	}
 	no := newObject.(*Object)
-	*o = *no
+	mediaType := no.mediaType
+	if mediaType == "" {
+		media, err := o.fs.waitMedia(ctx, no.id)
+		if err != nil {
+			if cleanupErr := no.remove(ctx, false); cleanupErr != nil {
+				fs.Debugf(no, "Failed to delete temporary O2 object id=%s after update failure: %v", no.id, cleanupErr)
+			}
+			return err
+		}
+		mediaType = media.MediaType
+	}
+
+	if err := o.remove(ctx, false); err != nil {
+		fs.Debugf(o, "Failed to delete old O2 object id=%s after temporary update upload: %v", o.id, err)
+		if cleanupErr := no.remove(ctx, false); cleanupErr != nil {
+			fs.Debugf(no, "Failed to delete temporary O2 object id=%s after update failure: %v", no.id, cleanupErr)
+		}
+		return err
+	}
+	media, err := o.fs.saveMediaMetadata(ctx, no.id, mediaType, leaf, folderID)
+	if err != nil {
+		return err
+	}
+
+	*o = *o.fs.newObjectFromMedia(src.Remote(), media)
 	return nil
 }
 
 // Remove removes an object.
 func (o *Object) Remove(ctx context.Context) error {
-	return o.fs.deleteFile(ctx, o.id)
+	return o.removeBatched(ctx, o.fs.opt.UseTrash)
+}
+
+func (o *Object) remove(ctx context.Context, useTrash bool) error {
+	return o.fs.deleteFile(ctx, o.id, useTrash)
+}
+
+func (o *Object) removeBatched(ctx context.Context, useTrash bool) error {
+	if o.fs.deleteBatcher == nil || !o.fs.deleteBatcher.Batching() {
+		return o.remove(ctx, useTrash)
+	}
+	_, err := o.fs.deleteBatcher.Commit(ctx, o.remote, deleteItem{id: o.id, useTrash: useTrash})
+	return err
 }
 
 // Fs returns the parent Fs.

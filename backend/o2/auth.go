@@ -38,6 +38,7 @@ const (
 )
 
 type authState struct {
+	Provider     string          `json:"provider"`
 	APIURL       string          `json:"api_url"`
 	DeviceID     string          `json:"device_id"`
 	LoginURL     string          `json:"login_url"`
@@ -87,9 +88,7 @@ type authResult struct {
 }
 
 var browserHeaders = map[string]string{
-	"Accept-Language":  "es-ES,es;q=0.9,en;q=0.8",
-	"User-Agent":       "Mozilla/5.0 (Linux; Android 15; Pixel 9 Build/AP4A.250205.002; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/137.0.7151.115 Mobile Safari/537.36",
-	"X-Requested-With": "es.o2online.cloud",
+	"Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
 }
 
 // Config runs the interactive O2 SMS login flow.
@@ -102,12 +101,16 @@ func Config(ctx context.Context, name string, m configmap.Mapper, in fs.ConfigIn
 		if err != nil {
 			return nil, err
 		}
+		profile, err := opt.provider()
+		if err != nil {
+			return nil, err
+		}
 		if opt.PhoneNumber == "" {
-			return fs.ConfigInput(statePhone, "config_phone_number", "O2 phone number used to receive the login SMS")
+			return fs.ConfigInput(statePhone, "config_phone_number", profile.Description+" phone number used to receive the login SMS")
 		}
 		m.Set(configPhoneNumber, opt.PhoneNumber)
 		if opt.AccessToken != "" && opt.RefreshToken != "" && opt.DeviceID != "" {
-			return fs.ConfigConfirm(stateConfirmReauth, false, "config_reauth", "O2 Cloud is already authenticated. Re-authenticate with SMS?")
+			return fs.ConfigConfirm(stateConfirmReauth, false, "config_reauth", profile.Description+" is already authenticated. Re-authenticate with SMS?")
 		}
 		return fs.ConfigGoto(stateStartAuth)
 
@@ -131,10 +134,18 @@ func Config(ctx context.Context, name string, m configmap.Mapper, in fs.ConfigIn
 			return nil, err
 		}
 		if opt.PhoneNumber == "" {
-			return fs.ConfigInput(statePhone, "config_phone_number", "O2 phone number used to receive the login SMS")
+			profile, err := opt.provider()
+			if err != nil {
+				return nil, err
+			}
+			return fs.ConfigInput(statePhone, "config_phone_number", profile.Description+" phone number used to receive the login SMS")
 		}
 		if opt.DeviceID == "" {
-			opt.DeviceID, err = newDeviceID()
+			profile, err := opt.provider()
+			if err != nil {
+				return nil, err
+			}
+			opt.DeviceID, err = newDeviceID(profile)
 			if err != nil {
 				return nil, err
 			}
@@ -148,7 +159,7 @@ func Config(ctx context.Context, name string, m configmap.Mapper, in fs.ConfigIn
 		if err != nil {
 			return nil, err
 		}
-		return fs.ConfigInput(fs.StatePush(stateSMSCode, encoded), "config_sms_code", "Enter the O2 SMS verification code")
+		return fs.ConfigInput(fs.StatePush(stateSMSCode, encoded), "config_sms_code", "Enter the "+started.providerDescription()+" SMS verification code")
 
 	case stateSMSCode:
 		code := strings.TrimSpace(in.Result)
@@ -170,6 +181,14 @@ func Config(ctx context.Context, name string, m configmap.Mapper, in fs.ConfigIn
 	return nil, fmt.Errorf("unknown O2 config state %q", in.State)
 }
 
+func (state authState) providerDescription() string {
+	profile, err := (Options{Provider: state.Provider}).provider()
+	if err != nil {
+		return "O2 Cloud"
+	}
+	return profile.Description
+}
+
 func popStateArg(state string) (string, string) {
 	if strings.ContainsRune(state, ',') {
 		newState, value := fs.StatePop(state)
@@ -181,7 +200,11 @@ func popStateArg(state string) (string, string) {
 func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	client := newAuthHTTPClient(ctx)
 
-	clientID, _, err := oauthClientCredentials()
+	profile, err := opt.provider()
+	if err != nil {
+		return authState{}, err
+	}
+	clientID, _, err := profile.oauthClientCredentials()
 	if err != nil {
 		return authState{}, err
 	}
@@ -199,24 +222,27 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	if err != nil {
 		return authState{}, err
 	}
-	authorizeURL, err := url.Parse(oauthAuthorizeURL)
+	authorizeURL, err := url.Parse(profile.OAuthAuthorizeURL)
 	if err != nil {
 		return authState{}, err
 	}
 	authorizeQuery := authorizeURL.Query()
 	authorizeQuery.Set("response_type", "code")
 	authorizeQuery.Set("client_id", clientID)
-	authorizeQuery.Set("redirect_uri", oauthRedirectURL)
-	authorizeQuery.Set("access_type", "offline")
-	authorizeQuery.Set("scope", "openid")
+	authorizeQuery.Set("redirect_uri", profile.OAuthRedirectURL)
+	authorizeQuery.Set("access_type", profile.OAuthAccessType)
+	authorizeQuery.Set("scope", profile.OAuthScope)
 	authorizeQuery.Set("state", oauthState)
 	authorizeQuery.Set("nonce", nonce)
 	authorizeQuery.Set("code_challenge", codeChallenge)
 	authorizeQuery.Set("code_challenge_method", "S256")
 	authorizeQuery.Set("acr_values", "2")
+	if profile.Name == providerMovistar {
+		authorizeQuery.Set("lang", "en")
+	}
 	authorizeURL.RawQuery = authorizeQuery.Encode()
 
-	resp, loginURL, err := authRequest(ctx, client, http.MethodGet, authorizeURL.String(), navigationHeaders(opt.APIURL, "cross-site"), "")
+	resp, loginURL, err := authRequest(ctx, client, http.MethodGet, authorizeURL.String(), navigationHeaders(profile, opt.APIURL, "cross-site"), "")
 	if err != nil {
 		return authState{}, err
 	}
@@ -231,18 +257,18 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	}
 	sessionID := loginParameters.Get("sessionID")
 	sessionData := loginParameters.Get("sessionData")
-	consumerID := loginParameters.Get("client_name")
+	consumerID := loginParameters.Get(profile.ConsumerParam)
 	if sessionID == "" || sessionData == "" || consumerID == "" || loginParameters.Get("state") == "" {
-		return authState{}, errors.New("O2 login did not return the Mi O2 session parameters")
+		return authState{}, fmt.Errorf("%s login did not return the required session parameters", profile.ErrorPrefix)
 	}
 	if loginParameters.Get("state") != oauthState {
-		return authState{}, errors.New("O2 login returned an invalid OAuth state")
+		return authState{}, fmt.Errorf("%s login returned an invalid OAuth state", profile.ErrorPrefix)
 	}
 	loginPageURL := stripURLFragment(loginURL)
-	redirectURL := oauthRedirectURL
+	redirectURL := profile.OAuthRedirectURL
 
 	environmentURL := resolveURL(loginPageURL, "/coco-envInfo/env.json")
-	resp, _, err = authRequest(ctx, client, http.MethodGet, environmentURL, jsonHeaders(loginPageURL), "")
+	resp, _, err = authRequest(ctx, client, http.MethodGet, environmentURL, jsonHeaders(profile, loginPageURL), "")
 	if err != nil {
 		return authState{}, err
 	}
@@ -255,21 +281,22 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 		return authState{}, err
 	}
 	if environment.APIGatewayURL == "" {
-		return authState{}, errors.New("O2 Mi O2 API gateway URL missing")
+		return authState{}, fmt.Errorf("%s authentication API gateway URL missing", profile.ErrorPrefix)
 	}
 
 	mobile := localMobileNumber(opt.PhoneNumber)
-	requestBody, err := json.Marshal(map[string]string{
-		"mobile":      mobile,
-		"sessionID":   sessionID,
-		"sessionData": sessionData,
-		"consumerId":  consumerID,
-	})
+	managePayload := map[string]string{
+		profile.ManageMobileKey:  mobile,
+		profile.ManageSessionKey: sessionID,
+		"sessionData":            sessionData,
+		"consumerId":             consumerID,
+	}
+	requestBody, err := json.Marshal(managePayload)
 	if err != nil {
 		return authState{}, err
 	}
-	manageURL := strings.TrimRight(environment.APIGatewayURL, "/") + "/cus/segu/v5/seguCredentialO2s/manageCredentialMobileO2"
-	resp, _, err = authRequest(ctx, client, http.MethodPost, manageURL, t3Headers(loginPageURL), string(requestBody))
+	manageURL := strings.TrimRight(environment.APIGatewayURL, "/") + profile.ManagePath
+	resp, _, err = authRequest(ctx, client, http.MethodPost, manageURL, t3Headers(profile, loginPageURL), string(requestBody))
 	if err != nil {
 		return authState{}, err
 	}
@@ -288,6 +315,7 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 	sessionData = firstNonEmpty(managed.NewSessionData, sessionData)
 
 	return authState{
+		Provider:     profile.Name,
 		APIURL:       opt.APIURL,
 		DeviceID:     opt.DeviceID,
 		LoginURL:     loginPageURL,
@@ -305,18 +333,22 @@ func startSMSAuth(ctx context.Context, opt Options) (authState, error) {
 func finishSMSAuth(ctx context.Context, started authState, code string) (authResult, error) {
 	client := newAuthHTTPClient(ctx)
 	importAuthCookies(client, started.Cookies)
+	profile, err := (Options{Provider: started.Provider}).provider()
+	if err != nil {
+		return authResult{}, err
+	}
 
 	requestBody, err := json.Marshal(map[string]string{
-		"otp":         code,
-		"sessionData": started.SessionData,
-		"sessionID":   started.SessionID,
-		"Mobile":      started.Mobile,
+		"otp":                    code,
+		"sessionData":            started.SessionData,
+		profile.VerifySessionKey: started.SessionID,
+		"Mobile":                 started.Mobile,
 	})
 	if err != nil {
 		return authResult{}, err
 	}
-	verifyURL := strings.TrimRight(started.OTPAPIURL, "/") + "/cus/segu/v5/seguCredentialO2s/verifyCredentialMobileO2"
-	resp, _, err := authRequest(ctx, client, http.MethodPost, verifyURL, t3Headers(started.LoginURL), string(requestBody))
+	verifyURL := strings.TrimRight(started.OTPAPIURL, "/") + profile.VerifyPath
+	resp, _, err := authRequest(ctx, client, http.MethodPost, verifyURL, t3Headers(profile, started.LoginURL), string(requestBody))
 	if err != nil {
 		return authResult{}, err
 	}
@@ -333,7 +365,7 @@ func finishSMSAuth(ctx context.Context, started authState, code string) (authRes
 		return authResult{}, smsFaultError(verified.FaultDetail)
 	}
 	if verified.RedirectURI == "" {
-		return authResult{}, errors.New("O2 SMS verification did not return a redirect URL")
+		return authResult{}, fmt.Errorf("%s SMS verification did not return a redirect URL", profile.ErrorPrefix)
 	}
 	callbackURL, err := url.Parse(verified.RedirectURI)
 	if err != nil {
@@ -344,22 +376,22 @@ func finishSMSAuth(ctx context.Context, started authState, code string) (authRes
 		return authResult{}, err
 	}
 	if callbackURL.Scheme != redirectURL.Scheme || callbackURL.Host != redirectURL.Host || callbackURL.Path != redirectURL.Path {
-		return authResult{}, fmt.Errorf("O2 SMS login returned an unexpected callback URL: %s", redactedURL(verified.RedirectURI))
+		return authResult{}, fmt.Errorf("%s SMS login returned an unexpected callback URL: %s", profile.ErrorPrefix, redactedURL(verified.RedirectURI))
 	}
 	callbackQuery := callbackURL.Query()
 	if callbackQuery.Get("state") == "" || callbackQuery.Get("state") != started.OAuthState {
-		return authResult{}, errors.New("O2 SMS login returned an invalid OAuth state")
+		return authResult{}, fmt.Errorf("%s SMS login returned an invalid OAuth state", profile.ErrorPrefix)
 	}
 	authorizationCode := callbackQuery.Get("code")
 	if authorizationCode == "" {
-		return authResult{}, errors.New("O2 SMS login did not return an authorization code")
+		return authResult{}, fmt.Errorf("%s SMS login did not return an authorization code", profile.ErrorPrefix)
 	}
 
-	result, err := exchangeOAuthCode(ctx, client, authorizationCode, started.CodeVerifier)
+	result, err := exchangeOAuthCodeForProfile(ctx, client, Options{Provider: profile.Name, DeviceID: started.DeviceID}, profile, authorizationCode, started.CodeVerifier)
 	if err != nil {
 		return authResult{}, err
 	}
-	return completeOAuthLogin(ctx, client, started.APIURL, started.DeviceID, result)
+	return completeOAuthLoginForProfile(ctx, client, Options{Provider: profile.Name}, profile, started.APIURL, started.DeviceID, result)
 }
 
 func saveAuthResult(m configmap.Mapper, result authResult) {
@@ -441,8 +473,8 @@ func authRequest(ctx context.Context, client *http.Client, method, rawURL string
 	return nil, "", errors.New("too many O2 authentication redirects")
 }
 
-func navigationHeaders(referer, fetchSite string) map[string]string {
-	headers := cloneHeaders(browserHeaders)
+func navigationHeaders(profile providerProfile, referer, fetchSite string) map[string]string {
+	headers := profileBrowserHeaders(profile)
 	headers["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"
 	headers["Referer"] = strings.TrimRight(stripURLFragment(referer), "/") + "/"
 	headers["Sec-Fetch-Dest"] = "document"
@@ -453,8 +485,8 @@ func navigationHeaders(referer, fetchSite string) map[string]string {
 	return headers
 }
 
-func jsonHeaders(referer string) map[string]string {
-	headers := cloneHeaders(browserHeaders)
+func jsonHeaders(profile providerProfile, referer string) map[string]string {
+	headers := profileBrowserHeaders(profile)
 	headers["Accept"] = "application/json, text/plain, */*"
 	headers["Referer"] = stripURLFragment(referer)
 	headers["Sec-Fetch-Dest"] = "empty"
@@ -463,8 +495,8 @@ func jsonHeaders(referer string) map[string]string {
 	return headers
 }
 
-func t3Headers(referer string) map[string]string {
-	headers := jsonHeaders(referer)
+func t3Headers(profile providerProfile, referer string) map[string]string {
+	headers := jsonHeaders(profile, referer)
 	headers["Content-Type"] = "application/json"
 	headers["Origin"] = origin(referer)
 	headers["Sec-Fetch-Site"] = "cross-site"
@@ -477,6 +509,17 @@ func cloneHeaders(headers map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+func profileBrowserHeaders(profile providerProfile) map[string]string {
+	headers := cloneHeaders(browserHeaders)
+	if profile.BrowserUserAgent != "" {
+		headers["User-Agent"] = profile.BrowserUserAgent
+	}
+	if profile.XRequestedWith != "" {
+		headers["X-Requested-With"] = profile.XRequestedWith
+	}
+	return headers
 }
 
 func encodeAuthState(state authState) (string, error) {
@@ -623,12 +666,20 @@ func newRandomHex() (string, error) {
 	return hex.EncodeToString(b[:]), nil
 }
 
-func newDeviceID() (string, error) {
+func newDeviceID(profile providerProfile) (string, error) {
+	if profile.DevicePrefix == "mox-" {
+		b := make([]byte, 16)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		value := base64.StdEncoding.EncodeToString(b)
+		return profile.DevicePrefix + value, nil
+	}
 	id, err := newRandomHex()
 	if err != nil {
 		return "", err
 	}
-	return "fac-" + id, nil
+	return firstNonEmpty(profile.DevicePrefix, "fac-") + id, nil
 }
 
 func newRandomBase64URL(size int) (string, error) {
