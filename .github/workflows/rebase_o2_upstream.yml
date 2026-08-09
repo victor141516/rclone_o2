@@ -1,0 +1,60 @@
+---
+name: Rebase O2 branch onto upstream
+
+on:
+  schedule:
+    - cron: '17 4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: rebase-o2-upstream
+  cancel-in-progress: false
+
+env:
+  TARGET_BRANCH: codex/o2-upload-optimization
+  UPSTREAM_REPOSITORY: https://github.com/rclone/rclone.git
+
+jobs:
+  rebase:
+    name: Rebase onto rclone master
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out O2 branch
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TARGET_BRANCH }}
+          fetch-depth: 0
+
+      - name: Rebase and push
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          old_sha="$(git rev-parse HEAD)"
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --no-tags upstream master:refs/remotes/upstream/master
+
+          if git merge-base --is-ancestor refs/remotes/upstream/master HEAD; then
+            echo "${TARGET_BRANCH} is already based on upstream/master." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if ! git rebase refs/remotes/upstream/master; then
+            git status --short
+            echo "Rebase conflict: ${TARGET_BRANCH} was not changed." >> "$GITHUB_STEP_SUMMARY"
+            git rebase --abort
+            exit 1
+          fi
+
+          git push \
+            --force-with-lease="refs/heads/${TARGET_BRANCH}:${old_sha}" \
+            origin "HEAD:refs/heads/${TARGET_BRANCH}"
+          echo "Rebased ${TARGET_BRANCH} onto upstream/master and pushed it safely." >> "$GITHUB_STEP_SUMMARY"
