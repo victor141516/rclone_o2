@@ -25,7 +25,7 @@ var retryErrorCodes = []int{
 }
 
 var redactedURLParameters = []string{
-	"validationkey", "k", "token", "key", "state", "nonce", "code", "sessionID", "sessionData", "jwt",
+	"validationkey", "k", "token", "key", "state", "nonce", "code", "sessionID", "sessionId", "sessionData", "jwt", "otp",
 }
 
 type apiError struct {
@@ -67,15 +67,30 @@ func (f *Fs) addCommonHeaders(req *http.Request) {
 }
 
 func (f *Fs) addBaseHeaders(req *http.Request) {
-	addBrowserHeaders(req)
-	req.Header.Set("User-Agent", apiUserAgent)
+	profile, err := f.opt.provider()
+	if err != nil {
+		profile, _ = (Options{}).provider()
+	}
+	addProfileHeaders(req, profile)
+	req.Header.Set("User-Agent", profile.APIUserAgent)
 	req.Header.Set("X-deviceid", f.opt.DeviceID)
 	req.Header.Set("Referer", f.opt.APIURL+"/")
 	req.Header.Set("Origin", f.opt.APIURL)
 }
 
 func addBrowserHeaders(req *http.Request) {
-	for key, value := range browserHeaders {
+	profile, err := (Options{}).provider()
+	if err != nil {
+		for key, value := range browserHeaders {
+			req.Header.Set(key, value)
+		}
+		return
+	}
+	addProfileHeaders(req, profile)
+}
+
+func addProfileHeaders(req *http.Request, profile providerProfile) {
+	for key, value := range profileBrowserHeaders(profile) {
 		req.Header.Set(key, value)
 	}
 }

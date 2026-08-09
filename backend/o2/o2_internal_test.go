@@ -301,6 +301,7 @@ func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 
 	m := configmap.Simple{"type": "o2", "api_url": server.URL, "upload_url": server.URL}
 	choices := configmap.Simple{
+		"provider":           "o2",
 		"phone_number":       "600 111 222",
 		"config_sms_code":    "123456",
 		"config_fs_advanced": "false",
@@ -338,6 +339,152 @@ func TestBackendConfigAllSMSLoginCompletes(t *testing.T) {
 	}
 }
 
+func TestMovistarSMSLoginCompletes(t *testing.T) {
+	var oauthState string
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/authorize":
+			query := r.URL.Query()
+			for name, want := range map[string]string{
+				"response_type":         "code",
+				"client_id":             defaultMovistarOAuthClientID,
+				"redirect_uri":          server.URL + "/ui/html/clientoauth.html",
+				"access_type":           "offline",
+				"scope":                 "openid",
+				"code_challenge_method": "S256",
+				"acr_values":            "2",
+				"lang":                  "en",
+			} {
+				if got := query.Get(name); got != want {
+					t.Fatalf("authorize %s = %q, want %q", name, got, want)
+				}
+			}
+			oauthState = query.Get("state")
+			fragment := url.Values{
+				"action":      {"login"},
+				"consumer_id": {"MCLOUD_APP"},
+				"client_id":   {defaultMovistarOAuthClientID},
+				"state":       {oauthState},
+				"sessionID":   {"session-1"},
+				"sessionData": {"data-1"},
+				"acr_values":  {"2"},
+			}.Encode()
+			http.Redirect(w, r, server.URL+"/segu-loginApp/#/accessUserPass?"+fragment, http.StatusFound)
+
+		case r.URL.Path == "/segu-loginApp/":
+			_, _ = w.Write([]byte("Movistar"))
+
+		case r.URL.Path == "/coco-envInfo/env.json":
+			_ = json.NewEncoder(w).Encode(map[string]any{"apiGwUrl": server.URL + "/t3/"})
+
+		case r.URL.Path == "/t3/cus/segu/v6/loginCredentialLAs/manageCredentialMobile":
+			var request struct {
+				ConsumerID  string `json:"consumerId"`
+				Mobile      string `json:"Mobile"`
+				SessionID   string `json:"sessionId"`
+				SessionData string `json:"sessionData"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if request.ConsumerID != "MCLOUD_APP" || request.Mobile != "600111222" || request.SessionID != "session-1" || request.SessionData != "data-1" {
+				t.Fatalf("manage credential request = %#v", request)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"newSessionID": "session-2", "newSessionData": "data-2"})
+
+		case r.URL.Path == "/t3/cus/segu/v6/loginCredentialLAs/verifyCredentialMobile":
+			var request struct {
+				OTP         string `json:"otp"`
+				SessionID   string `json:"sessionID"`
+				SessionData string `json:"sessionData"`
+				Mobile      string `json:"Mobile"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if request.OTP != "876709" || request.SessionID != "session-2" || request.SessionData != "data-2" || request.Mobile != "600111222" {
+				t.Fatalf("verify credential request = %#v", request)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"redirectUri": server.URL + "/ui/html/clientoauth.html?code=auth-code&state=" + url.QueryEscape(oauthState),
+			})
+
+		case r.URL.Path == "/token":
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			for name, want := range map[string]string{
+				"grant_type":    "authorization_code",
+				"code":          "auth-code",
+				"redirect_uri":  server.URL + "/ui/html/clientoauth.html",
+				"client_id":     defaultMovistarOAuthClientID,
+				"client_secret": defaultMovistarOAuthClientSecret,
+			} {
+				if got := r.Form.Get(name); got != want {
+					t.Fatalf("token %s = %q, want %q", name, got, want)
+				}
+			}
+			if r.Form.Get("code_verifier") == "" {
+				t.Fatal("token request is missing code_verifier")
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"access_token": "access-initial", "refresh_token": "refresh-initial", "expires_in": 3600, "token_type": "Bearer",
+			})
+
+		case r.URL.Path == "/sapi/login/oauth" && r.URL.Query().Get("action") == "login":
+			credential, found, err := parseOAuthAuthorization(r.Header.Get("Authorization"))
+			if err != nil || !found || credential.AccessToken != "access-initial" || credential.RefreshToken != "refresh-initial" || credential.Platform != movistarOAuthPlatform {
+				t.Fatalf("OAuth login credential = %+v, found=%v, err=%v", credential, found, err)
+			}
+			profile, err := (Options{Provider: providerMovistar}).provider()
+			if err != nil {
+				t.Fatal(err)
+			}
+			rotated, err := oauthAuthorizationForProfile(Options{
+				Provider: providerMovistar, AccessToken: "access-rotated", RefreshToken: "refresh-rotated", OAuthExpiresIn: "3600", OAuthLastRefreshDate: 12345,
+			}, profile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			w.Header().Set("Authorization", rotated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"data": map[string]any{
+				"validationkey": "validation-new", "jsessionid": "session-new",
+			}})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	oldAuthorizeURL, oldTokenURL, oldRedirectURL := movistarOAuthAuthorizeURL, movistarOAuthTokenURL, movistarOAuthRedirectURL
+	movistarOAuthAuthorizeURL = server.URL + "/authorize"
+	movistarOAuthTokenURL = server.URL + "/token"
+	movistarOAuthRedirectURL = server.URL + "/ui/html/clientoauth.html"
+	defer func() {
+		movistarOAuthAuthorizeURL, movistarOAuthTokenURL, movistarOAuthRedirectURL = oldAuthorizeURL, oldTokenURL, oldRedirectURL
+	}()
+
+	started, err := startSMSAuth(context.Background(), Options{
+		Provider:    providerMovistar,
+		PhoneNumber: "34600111222",
+		APIURL:      server.URL,
+		UploadURL:   server.URL,
+		DeviceID:    "mox-test",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := finishSMSAuth(context.Background(), started, "876709")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ValidationKey != "validation-new" || result.JSessionID != "session-new" || result.AccessToken != "access-rotated" || result.RefreshToken != "refresh-rotated" {
+		t.Fatalf("result = %#v", result)
+	}
+}
+
 func TestBackendConfigReportsSMSStartError(t *testing.T) {
 	ri, err := fs.Find("o2")
 	if err != nil {
@@ -372,6 +519,7 @@ func TestBackendConfigReportsSMSStartError(t *testing.T) {
 
 	m := configmap.Simple{"type": "o2", "api_url": server.URL, "upload_url": server.URL}
 	choices := configmap.Simple{
+		"provider":           "o2",
 		"phone_number":       "600 111 222",
 		"config_fs_advanced": "false",
 	}

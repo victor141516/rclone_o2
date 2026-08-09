@@ -23,8 +23,6 @@ const (
 	defaultOAuthAuthorizeURL = "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/authorize"
 	defaultOAuthTokenURL     = "https://apiseg.telefonica.es/openid/connect/auth/oauth/v2/o2/cus/token"
 	defaultOAuthRedirectURL  = "https://cloud.o2online.es/ui/html/clientoauth.html"
-	oauthPlatform            = "android"
-	apiUserAgent             = "omh android client 4.0.1"
 )
 
 var (
@@ -131,6 +129,16 @@ func oauthClientCredentials() (clientID, clientSecret string, err error) {
 	return clientID, clientSecret, nil
 }
 
+func (profile providerProfile) oauthClientCredentials() (clientID, clientSecret string, err error) {
+	if profile.Name == providerO2 {
+		return oauthClientCredentials()
+	}
+	if profile.OAuthClientID == "" {
+		return "", "", fmt.Errorf("%s OAuth client id missing", profile.Description)
+	}
+	return profile.OAuthClientID, profile.OAuthClientSecret, nil
+}
+
 func rawJSONText(value json.RawMessage) string {
 	text := strings.TrimSpace(string(value))
 	if len(text) >= 2 && text[0] == '"' && text[len(text)-1] == '"' {
@@ -155,13 +163,21 @@ func (f *Fs) hasOAuthCredentials() bool {
 }
 
 func oauthAuthorization(opt Options) (string, error) {
+	profile, err := opt.provider()
+	if err != nil {
+		return "", err
+	}
+	return oauthAuthorizationForProfile(opt, profile)
+}
+
+func oauthAuthorizationForProfile(opt Options, profile providerProfile) (string, error) {
 	if opt.AccessToken == "" || opt.RefreshToken == "" {
-		return "", errors.New("O2 OAuth credentials missing")
+		return "", fmt.Errorf("%s OAuth credentials missing", profile.ErrorPrefix)
 	}
 	payload, err := json.Marshal(oauthCredentialEnvelope{Data: oauthCredentialData{
 		AccessToken:     opt.AccessToken,
 		RefreshToken:    opt.RefreshToken,
-		Platform:        oauthPlatform,
+		Platform:        profile.OAuthPlatform,
 		ExpiresIn:       firstNonEmpty(opt.OAuthExpiresIn, "0"),
 		LastRefreshDate: opt.OAuthLastRefreshDate,
 	}})
@@ -250,7 +266,11 @@ func (f *Fs) reloginOAuth(ctx context.Context) (err error) {
 	f.authMu.Lock()
 	defer f.authMu.Unlock()
 
-	authorization, err := oauthAuthorization(f.opt)
+	profile, err := f.opt.provider()
+	if err != nil {
+		return err
+	}
+	authorization, err := oauthAuthorizationForProfile(f.opt, profile)
 	if err != nil {
 		return err
 	}
@@ -305,26 +325,43 @@ func (f *Fs) reloginOAuth(ctx context.Context) (err error) {
 }
 
 func exchangeOAuthCode(ctx context.Context, client *http.Client, code, verifier string) (authResult, error) {
-	clientID, clientSecret, err := oauthClientCredentials()
+	return exchangeOAuthCodeForProfile(ctx, client, Options{}, providerProfile{}, code, verifier)
+}
+
+func exchangeOAuthCodeForProfile(ctx context.Context, client *http.Client, opt Options, profile providerProfile, code, verifier string) (authResult, error) {
+	if profile.Name == "" {
+		var err error
+		profile, err = opt.provider()
+		if err != nil {
+			return authResult{}, err
+		}
+	}
+	clientID, clientSecret, err := profile.oauthClientCredentials()
 	if err != nil {
 		return authResult{}, err
 	}
 	formValues := url.Values{
 		"grant_type":    {"authorization_code"},
 		"code":          {code},
-		"redirect_uri":  {oauthRedirectURL},
+		"redirect_uri":  {profile.OAuthRedirectURL},
 		"code_verifier": {verifier},
 		"client_id":     {clientID},
-		"client_secret": {clientSecret},
+	}
+	if clientSecret != "" {
+		formValues.Set("client_secret", clientSecret)
 	}
 	form := strings.NewReader(formValues.Encode())
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, oauthTokenURL, form)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, profile.OAuthTokenURL, form)
 	if err != nil {
 		return authResult{}, err
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	addBrowserHeaders(req)
+	addProfileHeaders(req, profile)
+	req.Header.Set("User-Agent", profile.APIUserAgent)
+	if opt.DeviceID != "" {
+		req.Header.Set("X-deviceid", opt.DeviceID)
+	}
 	resp, err := client.Do(req)
 	if err != nil {
 		return authResult{}, err
@@ -349,13 +386,25 @@ func exchangeOAuthCode(ctx context.Context, client *http.Client, code, verifier 
 }
 
 func completeOAuthLogin(ctx context.Context, client *http.Client, apiURL, deviceID string, result authResult) (authResult, error) {
-	opt := Options{
+	return completeOAuthLoginForProfile(ctx, client, Options{}, providerProfile{}, apiURL, deviceID, result)
+}
+
+func completeOAuthLoginForProfile(ctx context.Context, client *http.Client, opt Options, profile providerProfile, apiURL, deviceID string, result authResult) (authResult, error) {
+	if profile.Name == "" {
+		var err error
+		profile, err = opt.provider()
+		if err != nil {
+			return authResult{}, err
+		}
+	}
+	loginOpt := Options{
+		Provider:             profile.Name,
 		AccessToken:          result.AccessToken,
 		RefreshToken:         result.RefreshToken,
 		OAuthExpiresIn:       result.OAuthExpiresIn,
 		OAuthLastRefreshDate: result.OAuthLastRefreshDate,
 	}
-	authorization, err := oauthAuthorization(opt)
+	authorization, err := oauthAuthorizationForProfile(loginOpt, profile)
 	if err != nil {
 		return authResult{}, err
 	}
@@ -363,8 +412,8 @@ func completeOAuthLogin(ctx context.Context, client *http.Client, apiURL, device
 	if err != nil {
 		return authResult{}, err
 	}
-	addBrowserHeaders(req)
-	req.Header.Set("User-Agent", apiUserAgent)
+	addProfileHeaders(req, profile)
+	req.Header.Set("User-Agent", profile.APIUserAgent)
 	req.Header.Set("X-deviceid", deviceID)
 	req.Header.Set("Authorization", authorization)
 	req.Header.Set("Accept", "application/json")
@@ -381,7 +430,7 @@ func completeOAuthLogin(ctx context.Context, client *http.Client, apiURL, device
 		return authResult{}, err
 	}
 	if found {
-		applyOAuthCredential(&opt, credential)
+		applyOAuthCredential(&loginOpt, credential)
 	}
 	var envelope oauthLoginEnvelope
 	if err := json.NewDecoder(resp.Body).Decode(&envelope); err != nil {
@@ -393,10 +442,10 @@ func completeOAuthLogin(ctx context.Context, client *http.Client, apiURL, device
 	if envelope.Data.ValidationKey == "" || envelope.Data.JSessionID == "" {
 		return authResult{}, errors.New("O2 OAuth login did not return a complete session")
 	}
-	result.AccessToken = opt.AccessToken
-	result.RefreshToken = opt.RefreshToken
-	result.OAuthExpiresIn = opt.OAuthExpiresIn
-	result.OAuthLastRefreshDate = opt.OAuthLastRefreshDate
+	result.AccessToken = loginOpt.AccessToken
+	result.RefreshToken = loginOpt.RefreshToken
+	result.OAuthExpiresIn = loginOpt.OAuthExpiresIn
+	result.OAuthLastRefreshDate = loginOpt.OAuthLastRefreshDate
 	result.ValidationKey = envelope.Data.ValidationKey
 	result.JSessionID = envelope.Data.JSessionID
 	result.DeviceID = deviceID

@@ -3,7 +3,6 @@ package o2
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -38,8 +37,19 @@ func init() {
 		NewFs:       NewFs,
 		Config:      Config,
 		Options: []fs.Option{{
+			Name:    "provider",
+			Help:    "Cloud provider to connect to.",
+			Default: providerO2,
+			Examples: []fs.OptionExample{{
+				Value: providerO2,
+				Help:  "O2 Cloud",
+			}, {
+				Value: providerMovistar,
+				Help:  "Movistar Cloud",
+			}},
+		}, {
 			Name:     "phone_number",
-			Help:     "O2 phone number used to receive the login SMS.\n\nUse international format, for example +34600111222, or a Spanish mobile number.",
+			Help:     "Phone number used to receive the login SMS.\n\nUse international format, for example +34600111222, or a Spanish mobile number.",
 			Required: true,
 		}, {
 			Name:     "root_folder_id",
@@ -66,6 +76,7 @@ func init() {
 
 // Options defines the configuration for this backend.
 type Options struct {
+	Provider             string               `config:"provider"`
 	PhoneNumber          string               `config:"phone_number"`
 	ValidationKey        string               `config:"validation_key"`
 	JSessionID           string               `config:"jsessionid"`
@@ -154,11 +165,18 @@ func readOptionsUnchecked(m configmap.Mapper) (Options, error) {
 	}
 
 	opt.PhoneNumber = normalizePhoneNumber(opt.PhoneNumber)
+	opt.Provider = normalizeProvider(opt.Provider)
 	opt.ValidationKey = revealValidationKey(opt.ValidationKey)
 	opt.JSessionID = revealJSessionID(opt.JSessionID)
 	opt.AccessToken = revealIfObscured(opt.AccessToken)
 	opt.RefreshToken = revealIfObscured(opt.RefreshToken)
 	opt.DeviceID = normalizeDeviceID(opt.DeviceID)
+	if opt.APIURL == "" || (opt.Provider == providerMovistar && opt.APIURL == defaultAPIURL) {
+		opt.APIURL, _ = providerDefaults(opt.Provider)
+	}
+	if opt.UploadURL == "" || (opt.Provider == providerMovistar && opt.UploadURL == defaultUploadURL) {
+		_, opt.UploadURL = providerDefaults(opt.Provider)
+	}
 	opt.APIURL = strings.TrimRight(opt.APIURL, "/")
 	opt.UploadURL = strings.TrimRight(opt.UploadURL, "/")
 
@@ -166,17 +184,21 @@ func readOptionsUnchecked(m configmap.Mapper) (Options, error) {
 }
 
 func (opt Options) validate() error {
+	profile, err := opt.provider()
+	if err != nil {
+		return err
+	}
 	if opt.PhoneNumber == "" {
-		return errors.New("O2 Cloud phone number missing; run \"rclone config reconnect\" to authenticate with SMS")
+		return fmt.Errorf("%s phone number missing; run \"rclone config reconnect\" to authenticate with SMS", profile.Description)
 	}
 	if opt.AccessToken == "" || opt.RefreshToken == "" {
-		return errors.New("O2 Cloud renewable OAuth credentials missing; run \"rclone config reconnect\" to authenticate with SMS")
+		return fmt.Errorf("%s renewable OAuth credentials missing; run \"rclone config reconnect\" to authenticate with SMS", profile.Description)
 	}
 	if opt.ValidationKey == "" || opt.JSessionID == "" {
-		return errors.New("O2 Cloud session missing; run \"rclone config reconnect\" to authenticate with SMS")
+		return fmt.Errorf("%s session missing; run \"rclone config reconnect\" to authenticate with SMS", profile.Description)
 	}
 	if opt.DeviceID == "" {
-		return errors.New("O2 Cloud device id missing; run \"rclone config reconnect\" to authenticate with SMS")
+		return fmt.Errorf("%s device id missing; run \"rclone config reconnect\" to authenticate with SMS", profile.Description)
 	}
 	return nil
 }
