@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"mime"
 	"mime/multipart"
@@ -11,7 +12,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -905,6 +908,98 @@ func TestVFSReadAtUsesRangeOptions(t *testing.T) {
 	}
 }
 
+func TestListMediaPaginates(t *testing.T) {
+	ctx := context.Background()
+	var offsets []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/media" || r.URL.Query().Get("action") != "get" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("folderid"); got != "42" {
+			t.Fatalf("folderid = %q, want 42", got)
+		}
+		if got := r.URL.Query().Get("limit"); got != "200" {
+			t.Fatalf("limit = %q, want 200", got)
+		}
+		offset := r.URL.Query().Get("offset")
+		offsets = append(offsets, offset)
+		media := make([]api.Media, 0, listPageSize)
+		switch offset {
+		case "":
+			for i := range listPageSize {
+				media = append(media, api.Media{ID: fmt.Sprintf("%d", i), Name: fmt.Sprintf("file-%03d", i)})
+			}
+		case "200":
+			for i := range listPageSize {
+				media = append(media, api.Media{ID: fmt.Sprintf("%d", 200+i), Name: fmt.Sprintf("file-%03d", 200+i)})
+			}
+		case "400":
+			media = append(media, api.Media{ID: "400", Name: "file-400"})
+		default:
+			t.Fatalf("unexpected offset %q", offset)
+		}
+		_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Media: media}})
+	}))
+	defer server.Close()
+
+	f := &Fs{opt: testOAuthOptions(server.URL), client: server.Client(), pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))}
+	media, err := f.listMedia(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(media) != 401 {
+		t.Fatalf("media count = %d, want 401", len(media))
+	}
+	if !slices.Equal(offsets, []string{"", "200", "400"}) {
+		t.Fatalf("offsets = %#v, want [\"\" \"200\" \"400\"]", offsets)
+	}
+}
+
+func TestListFoldersPaginates(t *testing.T) {
+	ctx := context.Background()
+	var offsets []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/media/folder" || r.URL.Query().Get("action") != "list" {
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("parentid"); got != "42" {
+			t.Fatalf("parentid = %q, want 42", got)
+		}
+		if got := r.URL.Query().Get("limit"); got != "200" {
+			t.Fatalf("limit = %q, want 200", got)
+		}
+		offset := r.URL.Query().Get("offset")
+		offsets = append(offsets, offset)
+		folders := make([]api.Folder, 0, listPageSize)
+		switch offset {
+		case "":
+			for i := range listPageSize {
+				folders = append(folders, api.Folder{ID: int64(i), Name: fmt.Sprintf("folder-%03d", i)})
+			}
+		case "200":
+			folders = append(folders, api.Folder{ID: 200, Name: "folder-200"})
+		default:
+			t.Fatalf("unexpected offset %q", offset)
+		}
+		_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Folders: folders}})
+	}))
+	defer server.Close()
+
+	f := &Fs{opt: testOAuthOptions(server.URL), client: server.Client(), pacer: fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant)))}
+	folders, err := f.listFolders(ctx, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(folders) != 201 {
+		t.Fatalf("folder count = %d, want 201", len(folders))
+	}
+	if !slices.Equal(offsets, []string{"", "200"}) {
+		t.Fatalf("offsets = %#v, want [\"\" \"200\"]", offsets)
+	}
+}
+
 func TestMoveUsesMediaTypeSpecificSaveMetadata(t *testing.T) {
 	ctx := context.Background()
 	var saveRequests int
@@ -986,6 +1081,344 @@ func TestMoveUsesMediaTypeSpecificSaveMetadata(t *testing.T) {
 	}
 	if saveRequests != 1 {
 		t.Fatalf("save requests = %d, want 1", saveRequests)
+	}
+}
+
+func TestUpdateUploadsWithTemporaryNameThenRenamesToOriginal(t *testing.T) {
+	ctx := context.Background()
+	const payload = "updated payload"
+	var uploadRequests, deleteRequests, saveRequests, listRequests int
+	var temporaryUploadName string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/sapi/upload" && r.URL.Query().Get("action") == "save":
+			uploadRequests++
+			body, err := io.ReadAll(r.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, params, err := mime.ParseMediaType(r.Header.Get("Content-Type"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			form, err := multipart.NewReader(bytes.NewReader(body), params["boundary"]).ReadForm(int64(len(body)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := len(form.Value["data"]); got != 1 {
+				t.Fatalf("upload data fields = %d, want 1", got)
+			}
+			var metadata struct {
+				Data struct {
+					Name     string `json:"name"`
+					FolderID int64  `json:"folderid"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(form.Value["data"][0]), &metadata); err != nil {
+				t.Fatal(err)
+			}
+			if metadata.Data.Name == "hello.txt" {
+				t.Fatal("update uploaded replacement with colliding original name")
+			}
+			if !strings.HasPrefix(metadata.Data.Name, "hello.txt.rclone-upload-") {
+				t.Fatalf("temporary upload name = %q, want hello.txt.rclone-upload-*", metadata.Data.Name)
+			}
+			if metadata.Data.FolderID != 1 {
+				t.Fatalf("temporary upload folderid = %d, want 1", metadata.Data.FolderID)
+			}
+			temporaryUploadName = metadata.Data.Name
+			files := form.File["file"]
+			if len(files) != 1 {
+				t.Fatalf("upload file parts = %d, want 1", len(files))
+			}
+			file, err := files[0].Open()
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer fs.CheckClose(file, &err)
+			gotPayload, err := io.ReadAll(file)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(gotPayload) != payload {
+				t.Fatalf("upload payload = %q, want %q", gotPayload, payload)
+			}
+			_ = json.NewEncoder(w).Encode(api.UploadResponse{Success: "true", ID: "456", Status: "V", Type: "file"})
+
+		case r.URL.Path == "/sapi/media/file" && r.URL.Query().Get("action") == "delete":
+			deleteRequests++
+			if got := r.URL.Query().Get("softdelete"); got != "false" {
+				t.Fatalf("update cleanup softdelete = %q, want false", got)
+			}
+			var request struct {
+				Data struct {
+					Files []int64 `json:"files"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			if len(request.Data.Files) != 1 || request.Data.Files[0] != 123 {
+				t.Fatalf("deleted files = %#v, want [123]", request.Data.Files)
+			}
+			if temporaryUploadName == "" {
+				t.Fatal("old object was deleted before temporary replacement upload")
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Success: "true"})
+
+		case r.URL.Path == "/sapi/upload/file" && r.URL.Query().Get("action") == "save-metadata":
+			saveRequests++
+			if deleteRequests == 0 {
+				t.Fatal("replacement was renamed before old object was deleted")
+			}
+			if err := r.ParseForm(); err != nil {
+				t.Fatal(err)
+			}
+			var request struct {
+				Data struct {
+					ID       int64  `json:"id"`
+					Name     string `json:"name"`
+					FolderID int64  `json:"folderid"`
+				} `json:"data"`
+			}
+			if err := json.Unmarshal([]byte(r.Form.Get("data")), &request); err != nil {
+				t.Fatal(err)
+			}
+			if request.Data.ID != 456 || request.Data.Name != "hello.txt" || request.Data.FolderID != 1 {
+				t.Fatalf("save metadata payload = %+v, want id=456 name=hello.txt folderid=1", request.Data)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]string{"success": "true", "id": "456"})
+
+		case r.URL.Path == "/sapi/media" && r.URL.Query().Get("action") == "get":
+			listRequests++
+			if saveRequests == 0 {
+				t.Fatal("updated object was listed before save-metadata")
+			}
+			_ = json.NewEncoder(w).Encode(api.Envelope{Data: api.Data{Media: []api.Media{{
+				ID:               "456",
+				Name:             "hello.txt",
+				MediaType:        "file",
+				Folder:           1,
+				Size:             int64(len(payload)),
+				ModificationDate: time.Now().UnixMilli(),
+			}}}})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name:   "o2test",
+		root:   "",
+		opt:    testOAuthOptions(server.URL),
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.dirCache = dircache.New("", "1", f)
+
+	existing := &Object{fs: f, remote: "hello.txt", id: "123", size: 3, mediaType: "file"}
+	src := object.NewStaticObjectInfo("hello.txt", time.Now(), int64(len(payload)), true, nil, f)
+	if err := existing.Update(ctx, strings.NewReader(payload), src); err != nil {
+		t.Fatal(err)
+	}
+	if existing.remote != "hello.txt" || existing.id != "456" || existing.size != int64(len(payload)) {
+		t.Fatalf("updated object = remote %q id %q size %d, want hello.txt/456/%d", existing.remote, existing.id, existing.size, len(payload))
+	}
+	if uploadRequests != 1 || deleteRequests != 1 || saveRequests != 1 || listRequests != 1 {
+		t.Fatalf("requests upload/delete/save/list = %d/%d/%d/%d, want 1/1/1/1", uploadRequests, deleteRequests, saveRequests, listRequests)
+	}
+}
+
+func TestUpdateKeepsOldObjectIfTemporaryUploadMetadataUnavailable(t *testing.T) {
+	ctx := context.Background()
+	var deletedIDs []int64
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/sapi/upload" && r.URL.Query().Get("action") == "save":
+			// Deliberately omit Type so Update must resolve metadata before deleting
+			// the old object.
+			_ = json.NewEncoder(w).Encode(api.UploadResponse{Success: "true", ID: "456", Status: "V"})
+
+		case r.URL.Path == "/sapi/media" && r.URL.Query().Get("action") == "get":
+			http.Error(w, "metadata unavailable", http.StatusInternalServerError)
+
+		case r.URL.Path == "/sapi/media/file" && r.URL.Query().Get("action") == "delete":
+			if got := r.URL.Query().Get("softdelete"); got != "false" {
+				t.Fatalf("temporary cleanup softdelete = %q, want false", got)
+			}
+			var request struct {
+				Data struct {
+					Files []int64 `json:"files"`
+				} `json:"data"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Fatal(err)
+			}
+			deletedIDs = append(deletedIDs, request.Data.Files...)
+			_ = json.NewEncoder(w).Encode(api.Envelope{Success: "true"})
+
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name:   "o2test",
+		root:   "",
+		opt:    testOAuthOptions(server.URL),
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	f.dirCache = dircache.New("", "1", f)
+
+	existing := &Object{fs: f, remote: "hello.txt", id: "123", size: 3}
+	src := object.NewStaticObjectInfo("hello.txt", time.Now(), int64(len("payload")), true, nil, f)
+	if err := existing.Update(ctx, strings.NewReader("payload"), src); err == nil {
+		t.Fatal("expected update error")
+	}
+	if existing.remote != "hello.txt" || existing.id != "123" {
+		t.Fatalf("old object changed to remote %q id %q, want hello.txt/123", existing.remote, existing.id)
+	}
+	if len(deletedIDs) != 1 || deletedIDs[0] != 456 {
+		t.Fatalf("deleted IDs = %#v, want only temporary object [456]", deletedIDs)
+	}
+}
+
+func TestRemoveUsesTrashOption(t *testing.T) {
+	ctx := context.Background()
+	for _, test := range []struct {
+		name           string
+		useTrash       bool
+		wantSoftDelete string
+	}{
+		{name: "trash", useTrash: true, wantSoftDelete: "true"},
+		{name: "hard delete", useTrash: false, wantSoftDelete: "false"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/sapi/media/file" || r.URL.Query().Get("action") != "delete" {
+					http.NotFound(w, r)
+					return
+				}
+				if got := r.URL.Query().Get("softdelete"); got != test.wantSoftDelete {
+					t.Fatalf("softdelete = %q, want %s", got, test.wantSoftDelete)
+				}
+				var request struct {
+					Data struct {
+						Files []int64 `json:"files"`
+					} `json:"data"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+					t.Fatal(err)
+				}
+				if len(request.Data.Files) != 1 || request.Data.Files[0] != 123 {
+					t.Fatalf("deleted files = %#v, want [123]", request.Data.Files)
+				}
+				_ = json.NewEncoder(w).Encode(api.Envelope{Success: "true"})
+			}))
+			defer server.Close()
+
+			f := &Fs{
+				name:   "o2test",
+				opt:    testOAuthOptions(server.URL),
+				client: server.Client(),
+				pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+			}
+			f.opt.UseTrash = test.useTrash
+			obj := &Object{fs: f, remote: "hello.txt", id: "123"}
+			if err := obj.Remove(ctx); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestRemoveBatchesDeletesByTrashMode(t *testing.T) {
+	ctx := context.Background()
+	type deleteRequest struct {
+		softdelete string
+		files      []int64
+	}
+	var mu sync.Mutex
+	var requests []deleteRequest
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/sapi/media/file" || r.URL.Query().Get("action") != "delete" {
+			http.NotFound(w, r)
+			return
+		}
+		var request struct {
+			Data struct {
+				Files []int64 `json:"files"`
+			} `json:"data"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		mu.Lock()
+		requests = append(requests, deleteRequest{softdelete: r.URL.Query().Get("softdelete"), files: request.Data.Files})
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(api.Envelope{Success: "true"})
+	}))
+	defer server.Close()
+
+	f := &Fs{
+		name:   "o2test",
+		opt:    testOAuthOptions(server.URL),
+		client: server.Client(),
+		pacer:  fs.NewPacer(ctx, pacer.NewDefault(pacer.MinSleep(minSleep), pacer.MaxSleep(maxSleep), pacer.DecayConstant(decayConstant))),
+	}
+	if err := f.initDeleteBatcher(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer f.deleteBatcher.Shutdown()
+
+	items := []struct {
+		id       string
+		remote   string
+		useTrash bool
+	}{
+		{id: "101", remote: "trash-1", useTrash: true},
+		{id: "102", remote: "trash-2", useTrash: true},
+		{id: "103", remote: "trash-3", useTrash: true},
+		{id: "201", remote: "hard-1", useTrash: false},
+		{id: "202", remote: "hard-2", useTrash: false},
+	}
+	var wg sync.WaitGroup
+	for _, item := range items {
+		item := item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			obj := &Object{fs: f, remote: item.remote, id: item.id}
+			if err := obj.removeBatched(ctx, item.useTrash); err != nil {
+				t.Errorf("removeBatched(%s) failed: %v", item.id, err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(requests) != 2 {
+		t.Fatalf("delete requests = %#v, want 2 batched requests", requests)
+	}
+	got := map[string][]int64{}
+	for _, request := range requests {
+		got[request.softdelete] = append(got[request.softdelete], request.files...)
+	}
+	slices.Sort(got["true"])
+	slices.Sort(got["false"])
+	if !slices.Equal(got["true"], []int64{101, 102, 103}) {
+		t.Fatalf("soft-delete files = %#v, want [101 102 103]", got["true"])
+	}
+	if !slices.Equal(got["false"], []int64{201, 202}) {
+		t.Fatalf("hard-delete files = %#v, want [201 202]", got["false"])
 	}
 }
 

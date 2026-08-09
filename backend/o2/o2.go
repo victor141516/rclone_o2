@@ -16,6 +16,7 @@ import (
 	"github.com/rclone/rclone/fs/config/configstruct"
 	"github.com/rclone/rclone/fs/fshttp"
 	"github.com/rclone/rclone/fs/hash"
+	"github.com/rclone/rclone/lib/batcher"
 	"github.com/rclone/rclone/lib/dircache"
 	"github.com/rclone/rclone/lib/encoder"
 	"github.com/rclone/rclone/lib/pacer"
@@ -28,6 +29,10 @@ const (
 	minSleep      = 10 * time.Millisecond
 	maxSleep      = 2 * time.Second
 	decayConstant = 2
+	listPageSize  = 200
+
+	deleteBatchSize    = 500
+	deleteBatchTimeout = 100 * time.Millisecond
 )
 
 func init() {
@@ -54,6 +59,11 @@ func init() {
 		}, {
 			Name:     "root_folder_id",
 			Help:     "Numeric root folder id. Leave blank to discover it from the API.",
+			Advanced: true,
+		}, {
+			Name:     "use_trash",
+			Help:     "Send files to the trash instead of deleting permanently.\n\nDefaults to true, namely sending files to the trash.\nUse `--o2-use-trash=false` to delete files permanently instead.",
+			Default:  true,
 			Advanced: true,
 		}, {
 			Name:     "api_url",
@@ -86,6 +96,7 @@ type Options struct {
 	OAuthExpiresIn       string               `config:"oauth_expires_in"`
 	OAuthLastRefreshDate int64                `config:"oauth_last_refresh_date"`
 	RootFolderID         string               `config:"root_folder_id"`
+	UseTrash             bool                 `config:"use_trash"`
 	APIURL               string               `config:"api_url"`
 	UploadURL            string               `config:"upload_url"`
 	Enc                  encoder.MultiEncoder `config:"encoding"`
@@ -93,15 +104,21 @@ type Options struct {
 
 // Fs represents an O2 Cloud remote.
 type Fs struct {
-	name     string
-	root     string
-	opt      Options
-	m        configmap.Mapper
-	features *fs.Features
-	client   *http.Client
-	pacer    *fs.Pacer
-	dirCache *dircache.DirCache
-	authMu   sync.Mutex
+	name          string
+	root          string
+	opt           Options
+	m             configmap.Mapper
+	features      *fs.Features
+	client        *http.Client
+	pacer         *fs.Pacer
+	dirCache      *dircache.DirCache
+	deleteBatcher *batcher.Batcher[deleteItem, struct{}]
+	authMu        sync.Mutex
+}
+
+type deleteItem struct {
+	id       string
+	useTrash bool
 }
 
 // Object describes an O2 Cloud object.
@@ -140,11 +157,40 @@ func NewFs(ctx context.Context, name, root string, m configmap.Mapper) (fs.Fs, e
 
 	if err := f.resolveRoot(ctx, rootFolderID); err != nil {
 		if err == fs.ErrorIsFile {
+			if err := f.initDeleteBatcher(ctx); err != nil {
+				return nil, err
+			}
 			return f, err
 		}
 		return nil, err
 	}
+	if err := f.initDeleteBatcher(ctx); err != nil {
+		return nil, err
+	}
 	return f, nil
+}
+
+func (f *Fs) initDeleteBatcher(ctx context.Context) error {
+	deleteBatcher, err := batcher.New[deleteItem, struct{}](ctx, f, f.commitDeleteBatch, batcher.Options{
+		Mode:               "sync",
+		Size:               deleteBatchSize,
+		Timeout:            deleteBatchTimeout,
+		MaxBatchSize:       deleteBatchSize,
+		DefaultTimeoutSync: deleteBatchTimeout,
+	})
+	if err != nil {
+		return err
+	}
+	f.deleteBatcher = deleteBatcher
+	return nil
+}
+
+// Shutdown the backend, flushing pending batched deletes.
+func (f *Fs) Shutdown(ctx context.Context) error {
+	if f.deleteBatcher != nil {
+		f.deleteBatcher.Shutdown()
+	}
+	return nil
 }
 
 func readOptions(m configmap.Mapper) (Options, error) {
@@ -295,13 +341,14 @@ func (f *Fs) Hashes() hash.Set { return hash.Set(hash.None) }
 func (f *Fs) Features() *fs.Features { return f.features }
 
 var (
-	_ fs.Fs        = (*Fs)(nil)
-	_ fs.Info      = (*Fs)(nil)
-	_ fs.Abouter   = (*Fs)(nil)
-	_ fs.Mover     = (*Fs)(nil)
-	_ fs.DirMover  = (*Fs)(nil)
-	_ fs.Purger    = (*Fs)(nil)
-	_ fs.Object    = (*Object)(nil)
-	_ fs.DirEntry  = (*Object)(nil)
-	_ fs.MimeTyper = (*Object)(nil)
+	_ fs.Fs         = (*Fs)(nil)
+	_ fs.Info       = (*Fs)(nil)
+	_ fs.Abouter    = (*Fs)(nil)
+	_ fs.Mover      = (*Fs)(nil)
+	_ fs.DirMover   = (*Fs)(nil)
+	_ fs.Purger     = (*Fs)(nil)
+	_ fs.Shutdowner = (*Fs)(nil)
+	_ fs.Object     = (*Object)(nil)
+	_ fs.DirEntry   = (*Object)(nil)
+	_ fs.MimeTyper  = (*Object)(nil)
 )

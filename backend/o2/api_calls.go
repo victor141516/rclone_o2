@@ -51,24 +51,44 @@ func (f *Fs) About(ctx context.Context) (*fs.Usage, error) {
 }
 
 func (f *Fs) listFolders(ctx context.Context, folderID int64) ([]api.Folder, error) {
-	var env api.Envelope
-	u := fmt.Sprintf("%s/sapi/media/folder?action=list&parentid=%d&limit=200", f.opt.APIURL, folderID)
-	if err := f.doJSON(ctx, http.MethodGet, u, nil, &env); err != nil {
-		return nil, err
+	var all []api.Folder
+	for offset := 0; ; offset += listPageSize {
+		var env api.Envelope
+		u := fmt.Sprintf("%s/sapi/media/folder?action=list&parentid=%d&limit=%d", f.opt.APIURL, folderID, listPageSize)
+		if offset > 0 {
+			u += fmt.Sprintf("&offset=%d", offset)
+		}
+		if err := f.doJSON(ctx, http.MethodGet, u, nil, &env); err != nil {
+			return nil, err
+		}
+		all = append(all, env.Data.Folders...)
+		if len(env.Data.Folders) < listPageSize {
+			break
+		}
 	}
-	fs.Debugf(f, "Listed %d O2 folders under folderID=%d", len(env.Data.Folders), folderID)
-	return env.Data.Folders, nil
+	fs.Debugf(f, "Listed %d O2 folders under folderID=%d", len(all), folderID)
+	return all, nil
 }
 
 func (f *Fs) listMedia(ctx context.Context, folderID int64) ([]api.Media, error) {
 	in := map[string]any{"data": map[string]any{"fields": defaultListFields}}
-	var env api.Envelope
-	u := fmt.Sprintf("%s/sapi/media?action=get&folderid=%d&limit=200", f.opt.APIURL, folderID)
-	if err := f.doJSON(ctx, http.MethodPost, u, in, &env); err != nil {
-		return nil, err
+	var all []api.Media
+	for offset := 0; ; offset += listPageSize {
+		var env api.Envelope
+		u := fmt.Sprintf("%s/sapi/media?action=get&folderid=%d&limit=%d", f.opt.APIURL, folderID, listPageSize)
+		if offset > 0 {
+			u += fmt.Sprintf("&offset=%d", offset)
+		}
+		if err := f.doJSON(ctx, http.MethodPost, u, in, &env); err != nil {
+			return nil, err
+		}
+		all = append(all, env.Data.Media...)
+		if len(env.Data.Media) < listPageSize {
+			break
+		}
 	}
-	fs.Debugf(f, "Listed %d O2 media items under folderID=%d", len(env.Data.Media), folderID)
-	return env.Data.Media, nil
+	fs.Debugf(f, "Listed %d O2 media items under folderID=%d", len(all), folderID)
+	return all, nil
 }
 
 func (f *Fs) createFolder(ctx context.Context, parentID int64, leaf string) (api.Folder, error) {
@@ -171,15 +191,55 @@ func (f *Fs) getMedia(ctx context.Context, id string) (api.Media, error) {
 	return env.Data.Media[0], nil
 }
 
-func (f *Fs) deleteFile(ctx context.Context, id string) error {
-	numericID, err := strconv.ParseInt(id, 10, 64)
-	if err != nil {
-		return err
+func (f *Fs) deleteFile(ctx context.Context, id string, useTrash bool) error {
+	return f.deleteFiles(ctx, []string{id}, useTrash)
+}
+
+func (f *Fs) deleteFiles(ctx context.Context, ids []string, useTrash bool) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	numericIDs := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		numericID, err := strconv.ParseInt(id, 10, 64)
+		if err != nil {
+			return err
+		}
+		numericIDs = append(numericIDs, numericID)
 	}
 
-	in := map[string]any{"data": map[string]any{"files": []int64{numericID}}}
-	fs.Debugf(f, "Soft deleting O2 file id=%s", id)
-	return f.doJSON(ctx, http.MethodPost, f.opt.APIURL+"/sapi/media/file?action=delete&softdelete=true", in, nil)
+	in := map[string]any{"data": map[string]any{"files": numericIDs}}
+	fs.Debugf(f, "Deleting %d O2 files useTrash=%v", len(ids), useTrash)
+	return f.doJSON(ctx, http.MethodPost, f.opt.APIURL+"/sapi/media/file?action=delete&softdelete="+strconv.FormatBool(useTrash), in, nil)
+}
+
+func (f *Fs) commitDeleteBatch(ctx context.Context, items []deleteItem, results []struct{}, errors []error) error {
+	idsByUseTrash := map[bool][]string{
+		false: {},
+		true:  {},
+	}
+	indexesByUseTrash := map[bool][]int{
+		false: {},
+		true:  {},
+	}
+	for i, item := range items {
+		idsByUseTrash[item.useTrash] = append(idsByUseTrash[item.useTrash], item.id)
+		indexesByUseTrash[item.useTrash] = append(indexesByUseTrash[item.useTrash], i)
+	}
+
+	for _, useTrash := range []bool{false, true} {
+		ids := idsByUseTrash[useTrash]
+		if len(ids) == 0 {
+			continue
+		}
+		err := f.deleteFiles(ctx, ids, useTrash)
+		if err != nil {
+			for _, i := range indexesByUseTrash[useTrash] {
+				errors[i] = err
+			}
+		}
+	}
+	return nil
 }
 
 func (f *Fs) deleteFolder(ctx context.Context, id int64) error {
